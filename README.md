@@ -54,17 +54,24 @@ curl -s ntfy.sh/<YOUR_TOPIC_NAME>
 
 ### Deduplication
 
-- **Exact-title dedup**: identical headlines across feeds are sent once.
-- **Semantic dedup (TF-IDF cosine)**: the same story reported with different
-  wording by different sources drops the duplicate — binary token cosine
-  similarity on cleaned headlines (threshold 0.40, ≥ 3 shared tokens), keeping
-  the most authoritative source (Dawn > Business Recorder > GNews).
-- **Cross-run dedup**: every sent article stores its title's content tokens and
-  top-5 keywords. A reworded version of the same story arriving in a later run
-  is skipped via keyword overlap (≥ 60%) or token cosine similarity
-  (≥ 0.40 with ≥ 3 shared tokens), e.g. "Seven former Australia captains appeal
-  for Imran Khan" vs "Allan Border, Steve Waugh among ex-Australia captains to
-  make humanitarian plea for Imran Khan".
+- **Canonical URL dedup**: links are normalized (host casing, `www`, fragments,
+  trailing slashes, and common tracking parameters removed) and checked within
+  a feed, across feeds, and against the saved sent-article cache.
+- **Paraphrase dedup**: normalized content words are compared across headlines;
+  when titles alone are not conclusive, title and RSS-summary fingerprints are
+  compared together. This catches reworded reports from different links while
+  requiring both title and broader-story evidence to avoid suppressing unrelated
+  stories that merely mention the same person or country.
+- **Cross-run dedup**: each sent article saves canonical links and title/story
+  fingerprints in the seen-article cache. New-format cache entries are checked
+  by URL, title similarity, and title-plus-summary similarity; older cache
+  entries remain readable. The existing example — "Seven former Australia
+  captains appeal for Imran Khan" vs "Allan Border, Steve Waugh among
+  ex-Australia captains to make humanitarian plea for Imran Khan" — is covered.
+- **Serialized runs**: GitHub Actions allows only one fetch-and-notify run at a
+  time, preventing overlapping jobs from both sending the same uncached story.
+- **Source priority**: when duplicate articles appear in one feed, the more
+  authoritative source wins (Dawn > Business Recorder > GNews).
 - **Per-source cap**: max 5 articles per source per run so one outlet can't flood.
 - **Round-robin interleave** across sources prevents one outlet from dominating
   the 12-article-per-run cap.
