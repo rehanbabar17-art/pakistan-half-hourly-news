@@ -25,6 +25,7 @@ from pathlib import Path
 
 import subprocess
 import sys
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 import feedparser
 import requests
@@ -142,7 +143,15 @@ STOP_WORDS = {
 
 def _tokenize(text: str) -> list[str]:
     words = re.findall(r"\b[a-z]{2,}\b", text.lower())
-    return [w for w in words if w not in STOP_WORDS]
+    tokens = []
+    for word in words:
+        if len(word) > 5 and word.endswith("ies"):
+            word = word[:-3] + "y"
+        elif len(word) > 5 and word.endswith("s") and not word.endswith("ss"):
+            word = word[:-1]
+        if word not in STOP_WORDS:
+            tokens.append(word)
+    return tokens
 
 
 def _sim_text(entry: dict) -> str:
@@ -157,6 +166,67 @@ def _cosine_sim(s1: set, s2: set) -> float:
         return 0.0
     shared = s1 & s2
     return len(shared) / math.sqrt(len(s1) * len(s2))
+
+
+def _canonical_url(url: str) -> str:
+    """Normalize article URLs, removing fragments and common tracking params."""
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(unquote(url.strip()))
+        if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+            return ""
+        host = parts.netloc.lower().split(":", 1)[0]
+        if host.startswith("www."):
+            host = host[4:]
+        query = []
+        for key, value in parse_qsl(parts.query, keep_blank_values=True):
+            key_lower = key.lower()
+            if (key_lower.startswith("utm_") or key_lower in {
+                    "fbclid", "gclid", "dclid", "mc_cid", "mc_eid",
+                    "oc", "ceid", "hl", "gl"}):
+                continue
+            query.append((key, value))
+        path = re.sub(r"/{2,}", "/", parts.path).rstrip("/") or "/"
+        return urlunsplit(("https", host, path, urlencode(sorted(query)), ""))
+    except Exception:
+        return ""
+
+
+def _entry_urls(entry: dict) -> set[str]:
+    values = [entry.get("link", "")]
+    values.extend(item.get("href", "") for item in entry.get("links", [])
+                  if isinstance(item, dict))
+    return {normalized for value in values
+            if (normalized := _canonical_url(value))}
+
+
+def _story_tokens(entry: dict) -> set[str]:
+    """Content-bearing title and RSS summary terms for paraphrase checks."""
+    title = _sim_text(entry)
+    summary = _GNEWS_SUFFIX_RE.sub("", entry.get("summary") or "").strip()
+    return set(_tokenize(f"{title} {summary}"))
+
+
+def _semantic_match(left_title: set[str], left_story: set[str],
+                    right_title: set[str], right_story: set[str]) -> bool:
+    """Conservative title match, with a stricter title+summary fallback."""
+    title_shared = len(left_title & right_title)
+    if (title_shared >= MIN_SHARED_TOKENS
+            and _cosine_sim(left_title, right_title) >= COSINE_THRESHOLD):
+        return True
+    story_shared = len(left_story & right_story)
+    return (title_shared >= 2 and story_shared >= 5
+            and _cosine_sim(left_story, right_story) >= 0.42)
+
+
+def _same_article_entries(left: dict, right: dict) -> bool:
+    """Match stable URL identity first, then title/summary semantics."""
+    if _entry_urls(left) & _entry_urls(right):
+        return True
+    return _semantic_match(
+        set(_tokenize(_sim_text(left))), _story_tokens(left),
+        set(_tokenize(_sim_text(right))), _story_tokens(right))
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -234,8 +304,7 @@ def save_seen(seen: dict) -> None:
 
 
 def title_key(title: str) -> str:
-    t = _GNEWS_SUFFIX_RE.sub("", title or "").strip().lower()
-    t = re.sub(r"\s+", " ", t)
+    t = " ".join(_tokenize(_GNEWS_SUFFIX_RE.sub("", title or "")))
     return hashlib.sha256(t.encode()).hexdigest()[:16]
 
 
@@ -275,6 +344,38 @@ def seen_semantic_match(tokens: set, seen: dict,
         if len(tokens & seen_tokens) < min_shared:
             continue
         if _cosine_sim(tokens, seen_tokens) >= cos_threshold:
+            return True
+    return False
+
+
+def seen_url_match(entry: dict, seen: dict) -> bool:
+    """Check normalized URLs against the persistent sent-article cache."""
+    urls = _entry_urls(entry)
+    if not urls:
+        return False
+    for val in seen.values():
+        if not isinstance(val, dict):
+            continue
+        stored = set(val.get("urls", []))
+        if isinstance(val.get("url"), str) and val["url"]:
+            stored.add(val["url"])
+        if urls & stored:
+            return True
+    return False
+
+
+def seen_story_match(entry: dict, seen: dict) -> bool:
+    """Compare title and summary fingerprints against prior notifications."""
+    title_tokens = set(_tokenize(_sim_text(entry)))
+    story_tokens = _story_tokens(entry)
+    for val in seen.values():
+        if not isinstance(val, dict):
+            continue
+        seen_title = set(val.get("tt", "").split(",")) - {""}
+        seen_story = set(val.get("st", "").split(",")) - {""}
+        if not seen_story:
+            seen_story = seen_title
+        if _semantic_match(title_tokens, story_tokens, seen_title, seen_story):
             return True
     return False
 
@@ -359,7 +460,13 @@ def _collect_feed(feed_cfg: dict, seen: dict, now, run_started: float) -> list[d
         tk = title_key(entry.get("title", ""))
         if tk in seen:
             continue
+        if seen_url_match(entry, seen):
+            print(f"    ↯ URL match (already sent): {entry.get('title','')[:50]}")
+            continue
         title_tokens = set(_tokenize(_sim_text(entry)))
+        if seen_story_match(entry, seen):
+            print(f"    ↯ story match (already sent): {entry.get('title','')[:50]}")
+            continue
         if fingerprint_matches(entry_text(entry), seen):
             print(f"    ↯ fingerprint match (already sent): {entry.get('title','')[:50]}")
             continue
@@ -398,7 +505,6 @@ def _semantic_dedup(articles: list[dict],
     if len(articles) <= 1:
         return articles
 
-    token_sets = [set(_tokenize(_sim_text(a["entry"]))) for a in articles]
     dropped: set[int] = set()
 
     for i in range(len(articles)):
@@ -407,11 +513,7 @@ def _semantic_dedup(articles: list[dict],
         for j in range(i + 1, len(articles)):
             if j in dropped:
                 continue
-            s1, s2 = token_sets[i], token_sets[j]
-            if len(s1 & s2) < min_shared:
-                continue
-            sim = _cosine_sim(s1, s2)
-            if sim < cos_threshold:
+            if not _same_article_entries(articles[i]["entry"], articles[j]["entry"]):
                 continue
             pri_i = SOURCE_PRIORITY.get(articles[i]["source"], 99)
             pri_j = SOURCE_PRIORITY.get(articles[j]["source"], 99)
@@ -456,7 +558,6 @@ def main() -> None:
     now = datetime.now(timezone.utc)
     seen = load_seen()
     sent: list[dict] = []
-    sent_tokens: list[set] = []
     source_used: Counter = Counter()
     run_started = time.time()
 
@@ -471,15 +572,12 @@ def main() -> None:
         if not cands:
             continue
 
-        # Drop near-duplicates of stories already sent earlier in this run
-        # (the earlier, higher-priority source wins).
+        # Drop duplicate links and paraphrased stories already sent earlier
+        # in this run (feed ordering gives earlier sources priority).
         kept = []
         for c in cands:
-            dup = any(
-                _cosine_sim(c["tokens"], st) >= COSINE_THRESHOLD
-                and len(c["tokens"] & st) >= MIN_SHARED_TOKENS
-                for st in sent_tokens
-            )
+            dup = any(_same_article_entries(c["entry"], prior["entry"])
+                      for prior in sent)
             if not dup:
                 kept.append(c)
         if len(kept) < len(cands):
@@ -494,12 +592,17 @@ def main() -> None:
             ok = send_to_ntfy(body)
             if ok:
                 sent.append(art)
-                sent_tokens.append(art["tokens"])
                 source_used[art["source"]] += 1
+                urls = sorted(_entry_urls(art["entry"]))
+                title_tokens = sorted(set(_tokenize(_sim_text(art["entry"]))))
+                story_tokens = sorted(_story_tokens(art["entry"]))
                 seen[art["id"]] = {
                     "ts": int(time.time()),
                     "kw": ",".join(extract_keywords(entry_text(art["entry"]))),
-                    "tt": ",".join(sorted(art["tokens"])),
+                    "tt": ",".join(title_tokens),
+                    "st": ",".join(story_tokens),
+                    "urls": urls,
+                    "url": urls[0] if urls else "",
                 }
                 # Persist after every send so a run killed mid-way (e.g. by the
                 # outer watchdog) never re-sends what was already delivered.
