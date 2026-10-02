@@ -270,6 +270,8 @@ class _ArticlePageParser(HTMLParser):
 
 def _extractive_summary(text: str, limit: int = 280) -> str:
     """Return a short page-derived summary without requiring an LLM/API key."""
+    if _is_google_news_boilerplate(text):
+        return ""
     sentences = re.split(r"(?<=[.!?])\s+", text.strip())
     chosen = []
     for sentence in sentences:
@@ -280,6 +282,13 @@ def _extractive_summary(text: str, limit: int = 280) -> str:
             break
     summary = " ".join(chosen)
     return summary[:limit].rstrip() + ("…" if len(summary) > limit else "")
+
+
+def _is_google_news_boilerplate(text: str) -> bool:
+    """Detect the generic Google News wrapper returned for RSS article URLs."""
+    normalized = " ".join((text or "").lower().split())
+    marker = "comprehensive up-to-date news coverage, aggregated from sources all over the world by google news"
+    return normalized.count(marker) >= 1
 
 
 def _fetch_article_page(url: str) -> tuple[str, str]:
@@ -297,6 +306,9 @@ def _fetch_article_page(url: str) -> tuple[str, str]:
         parser = _ArticlePageParser()
         parser.feed(response.text)
         text = parser.text()
+        if _is_google_news_boilerplate(text):
+            print(f"    ⚠  Google News wrapper detected; keeping RSS data only: {canonical}", file=sys.stderr)
+            return "", ""
         return text, _extractive_summary(text)
     except Exception as exc:
         print(f"    ⚠  Article page unavailable ({canonical}): {exc}", file=sys.stderr)

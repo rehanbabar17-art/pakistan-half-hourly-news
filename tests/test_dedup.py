@@ -80,6 +80,16 @@ class DuplicateDetectionTests(unittest.TestCase):
         self.assertIn("first meaningful", parser.text())
         self.assertNotIn("ignore me", parser.text())
 
+    def test_google_news_wrapper_is_not_used_as_article_summary(self):
+        wrapper = (
+            "Google News Comprehensive up-to-date news coverage, aggregated from "
+            "sources all over the world by Google News. "
+            "Comprehensive up-to-date news coverage, aggregated from sources all "
+            "over the world by Google News."
+        )
+        self.assertTrue(news._is_google_news_boilerplate(wrapper))
+        self.assertEqual(news._extractive_summary(wrapper), "")
+
     def test_persistent_cache_blocks_urls_and_paraphrased_stories(self):
         entry = {
             "title": "Border and Waugh join former Australia captains' appeal for Imran Khan",
