@@ -62,6 +62,14 @@ curl -s ntfy.sh/<YOUR_TOPIC_NAME>
   compared together. This catches reworded reports from different links while
   requiring both title and broader-story evidence to avoid suppressing unrelated
   stories that merely mention the same person or country.
+- **Article-page verification**: after an item passes the time and importance
+  filters, the fetcher opens up to 12 article links per feed, extracts the page
+  title/description/body, and creates a short extractive summary. The extracted
+  body is used as an additional story fingerprint, so two outlets can be
+  skipped even when their RSS headlines are substantially different. Page
+  requests are bounded by a 6-second timeout and failures fall back to RSS data.
+- **Notification summary**: when page extraction succeeds, the ntfy message
+  includes the short page-derived summary above the source link.
 - **Cross-run dedup**: each sent article saves canonical links and title/story
   fingerprints in the seen-article cache. New-format cache entries are checked
   by URL, title similarity, and title-plus-summary similarity; older cache

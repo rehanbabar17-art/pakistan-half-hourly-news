@@ -13,6 +13,7 @@ Environment variables:
 """
 
 import hashlib
+from html.parser import HTMLParser
 import json
 import math
 import os
@@ -47,6 +48,9 @@ PKT = timezone(timedelta(hours=5))
 WINDOW_MINUTES = 6 * 60   # 360 minutes (6 hours)
 MAX_PER_RUN    = 12       # hard cap per cron run
 FETCH_TIMEOUT  = 12           # seconds per feed — skip slow/hanging feeds
+ARTICLE_TIMEOUT = 6           # seconds per article page — dedup enrichment only
+ARTICLE_TEXT_LIMIT = 12_000   # bound memory and state size for extracted pages
+MAX_ARTICLE_ENRICH = 12       # avoid spending the whole run on low-value pages
 RUN_DEADLINE   = 170         # hard cap for the whole script (s)
 SEEN_SCAN_HOURS = 12         # only scan dedup cache entries from last 12h
 
@@ -202,10 +206,101 @@ def _entry_urls(entry: dict) -> set[str]:
 
 
 def _story_tokens(entry: dict) -> set[str]:
-    """Content-bearing title and RSS summary terms for paraphrase checks."""
+    """Content-bearing title, RSS summary, and fetched-page terms."""
     title = _sim_text(entry)
     summary = _GNEWS_SUFFIX_RE.sub("", entry.get("summary") or "").strip()
-    return set(_tokenize(f"{title} {summary}"))
+    page = entry.get("article_text") or ""
+    return set(_tokenize(f"{title} {summary} {page}"))
+
+
+class _ArticlePageParser(HTMLParser):
+    """Small dependency-free extractor for article text and meta descriptions."""
+
+    _SKIP = {"script", "style", "noscript", "svg", "nav", "footer", "header"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._skip = 0
+        self._title = []
+        self._meta = []
+        self._paragraphs = []
+        self._current = []
+        self._in_title = False
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        attrs = {k.lower(): v for k, v in attrs}
+        if tag in self._SKIP:
+            self._skip += 1
+        elif tag == "title" and not self._skip:
+            self._in_title = True
+        elif tag == "meta" and not self._skip:
+            key = (attrs.get("name") or attrs.get("property") or "").lower()
+            if key in {"description", "og:description", "twitter:description"}:
+                if attrs.get("content"):
+                    self._meta.append(attrs["content"])
+        elif tag == "p" and not self._skip:
+            self._current = []
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in self._SKIP and self._skip:
+            self._skip -= 1
+        elif tag == "title":
+            self._in_title = False
+        elif tag == "p" and self._current and not self._skip:
+            text = " ".join("".join(self._current).split())
+            if len(text) >= 40:
+                self._paragraphs.append(text)
+            self._current = []
+
+    def handle_data(self, data):
+        if self._skip:
+            return
+        if self._in_title:
+            self._title.append(data)
+        elif self._current is not None:
+            self._current.append(data)
+
+    def text(self) -> str:
+        parts = [" ".join("".join(self._title).split()), *self._meta]
+        parts.extend(self._paragraphs[:80])
+        return " ".join(p.strip() for p in parts if p.strip())[:ARTICLE_TEXT_LIMIT]
+
+
+def _extractive_summary(text: str, limit: int = 280) -> str:
+    """Return a short page-derived summary without requiring an LLM/API key."""
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    chosen = []
+    for sentence in sentences:
+        sentence = " ".join(sentence.split())
+        if len(sentence) >= 40:
+            chosen.append(sentence)
+        if len(" ".join(chosen)) >= limit:
+            break
+    summary = " ".join(chosen)
+    return summary[:limit].rstrip() + ("…" if len(summary) > limit else "")
+
+
+def _fetch_article_page(url: str) -> tuple[str, str]:
+    """Open an article link and return extracted text plus an extractive summary."""
+    canonical = _canonical_url(url)
+    if not canonical:
+        return "", ""
+    try:
+        response = requests.get(
+            canonical,
+            timeout=(3, ARTICLE_TIMEOUT),
+            headers={"User-Agent": "Mozilla/5.0 (compatible; NewsDedup/1.0)"},
+        )
+        response.raise_for_status()
+        parser = _ArticlePageParser()
+        parser.feed(response.text)
+        text = parser.text()
+        return text, _extractive_summary(text)
+    except Exception as exc:
+        print(f"    ⚠  Article page unavailable ({canonical}): {exc}", file=sys.stderr)
+        return "", ""
 
 
 def _semantic_match(left_title: set[str], left_story: set[str],
@@ -216,8 +311,15 @@ def _semantic_match(left_title: set[str], left_story: set[str],
             and _cosine_sim(left_title, right_title) >= COSINE_THRESHOLD):
         return True
     story_shared = len(left_story & right_story)
-    return (title_shared >= 2 and story_shared >= 5
-            and _cosine_sim(left_story, right_story) >= 0.42)
+    if (title_shared >= 2 and story_shared >= 5
+            and _cosine_sim(left_story, right_story) >= 0.42):
+        return True
+    # A publisher may use a completely different headline. A high-overlap
+    # fetched body is sufficient in that case, while the stricter thresholds
+    # protect short RSS snippets from collapsing unrelated stories.
+    return ((title_shared >= 1 and story_shared >= 8
+             and _cosine_sim(left_story, right_story) >= 0.30)
+            or (story_shared >= 10 and _cosine_sim(left_story, right_story) >= 0.55))
 
 
 def _same_article_entries(left: dict, right: dict) -> bool:
@@ -426,8 +528,12 @@ def format_message(entry: dict, source: str, scope: str) -> str:
         f"{tag} [{source}] {title}",
         "",
         f"📰 {scope.upper()} — {ts}" if ts else f"📰 {scope.upper()}",
-        f"🔗 {link}",
     ]
+    if entry.get("article_summary"):
+        lines.extend([f"📝 {entry['article_summary']}", ""])
+    lines.extend([
+        f"🔗 {link}",
+    ])
     return "\n".join(lines)
 
 
@@ -453,6 +559,7 @@ def _collect_feed(feed_cfg: dict, seen: dict, now, run_started: float) -> list[d
         return []
 
     raw: list[dict] = []
+    enriched = 0
     for entry in parsed.entries[:40]:
         if time.time() - run_started > RUN_DEADLINE:
             print("  ⚠  Run deadline reached — stopping entry scan.", file=sys.stderr)
@@ -477,10 +584,22 @@ def _collect_feed(feed_cfg: dict, seen: dict, now, run_started: float) -> list[d
             continue
         if not is_important(entry, scope):
             continue
+        # RSS descriptions are often copied verbatim between outlets. Open a
+        # bounded number of links so body text can distinguish genuinely
+        # related reports whose headlines use different wording.
+        candidate = dict(entry)
+        if enriched < MAX_ARTICLE_ENRICH:
+            page_text, page_summary = _fetch_article_page(entry.get("link", ""))
+            candidate["article_text"] = page_text
+            candidate["article_summary"] = page_summary
+            enriched += 1
+        if seen_story_match(candidate, seen):
+            print(f"    ↯ story match (article page, already sent): {entry.get('title','')[:50]}")
+            continue
         raw.append({
             "source":  name,
             "scope":   scope,
-            "entry":   entry,
+            "entry":   candidate,
             "id":      tk,
             "tokens":  title_tokens,
         })
@@ -595,7 +714,10 @@ def main() -> None:
                 source_used[art["source"]] += 1
                 urls = sorted(_entry_urls(art["entry"]))
                 title_tokens = sorted(set(_tokenize(_sim_text(art["entry"]))))
-                story_tokens = sorted(_story_tokens(art["entry"]))
+                # Keep the cache compact even when an article page contains a
+                # long body; title/summary/page fingerprints are still broad
+                # enough for the next 12-hour deduplication window.
+                story_tokens = sorted(_story_tokens(art["entry"]))[:120]
                 seen[art["id"]] = {
                     "ts": int(time.time()),
                     "kw": ",".join(extract_keywords(entry_text(art["entry"]))),
