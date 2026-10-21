@@ -121,6 +121,25 @@ def _build_keyword_regex(keywords: list[str]) -> re.Pattern:
 
 KEYWORD_RE = _build_keyword_regex(HIGH_PRIORITY_KEYWORDS)
 
+# Google News' broad "Imran Khan" search also returns the Indian/Bollywood
+# actor with the same name. Require a positive identity signal for the former
+# Pakistan captain and politician; mere mentions of Pakistan are insufficient.
+IMRAN_KHAN_RE = re.compile(r"\bImran\s+Khan\b", re.IGNORECASE)
+IMRAN_PAKISTAN_IDENTITY_RE = re.compile(
+    r"\b(?:pti\b|pakistan\s+tehreek[- ]e[- ]insaf|"
+    r"(?:pakistan(?:i|['’]s)?\s+)?(?:former\s+|ex[- ]|jailed\s+|imprisoned\s+)?"
+    r"(?:prime\s+minister|premier|cricketer|cricket\s+captain|politician)|"
+    r"(?:former|ex[- ])\s*(?:pakistan(?:i)?\s+)?(?:prime\s+minister|premier|"
+    r"cricketer|cricket\s+captain|captain\s+of\s+pakistan|politician)|"
+    r"pakistan['’]s\s+(?:ousted|jailed|imprisoned)\s+(?:premier|prime\s+minister)|"
+    r"former\s+captain\s+of\s+pakistan)\b",
+    re.IGNORECASE,
+)
+IMRAN_INDIAN_ACTOR_RE = re.compile(
+    r"\b(?:bollywood|indian\s+actor|actor\s+from\s+india|film\s+actor)\b",
+    re.IGNORECASE,
+)
+
 # ─── Tokenisation + similarity (hand-rolled, no dependencies) ─────────────────
 
 STOP_WORDS = {
@@ -516,9 +535,16 @@ def is_recent(entry: dict, now: datetime) -> bool:
 
 
 def is_important(entry: dict, scope: str) -> bool:
+    text = (entry.get("title") or "") + " " + (entry.get("summary") or "")
+    if IMRAN_KHAN_RE.search(text):
+        # Reject explicit actor coverage first, even if it happens to mention
+        # politics or Pakistan elsewhere in the RSS description.
+        if IMRAN_INDIAN_ACTOR_RE.search(text):
+            return False
+        if not IMRAN_PAKISTAN_IDENTITY_RE.search(text):
+            return False
     if scope == "national":
         return True
-    text = (entry.get("title") or "") + " " + (entry.get("summary") or "")
     return bool(KEYWORD_RE.search(text))
 
 
