@@ -41,6 +41,10 @@ curl -s ntfy.sh/<YOUR_TOPIC_NAME>
 - All timestamps are in **Pakistan Standard Time (PKT / UTC+5)**.
 - **National** articles always pass through; **international** articles must
   match priority keywords (word-boundary regex, no false positives).
+- Any story mentioning **Imran Khan** must also identify him as Pakistan's
+  former prime minister/cricketer or include a PTI identity cue. Explicit
+  Bollywood/Indian-actor coverage and ambiguous name-only results are filtered,
+  including on national feeds.
 
 ### Tracked keywords
 

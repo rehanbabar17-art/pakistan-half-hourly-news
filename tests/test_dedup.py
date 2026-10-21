@@ -10,6 +10,41 @@ import fetch_news as news
 
 
 class DuplicateDetectionTests(unittest.TestCase):
+    def test_indian_actor_named_imran_khan_is_rejected(self):
+        entry = {
+            "title": "Indian actor Imran Khan returns to films after long break",
+            "summary": "The Bollywood actor from India discussed upcoming film projects.",
+        }
+        self.assertFalse(news.is_important(entry, "international"))
+        # Apply the identity guard to national feeds too, not just the broad
+        # international Imran Khan search.
+        self.assertFalse(news.is_important(entry, "national"))
+
+    def test_pakistani_politician_and_cricketer_imran_khan_is_kept(self):
+        entries = [
+            {"title": "Former Pakistan prime minister Imran Khan's appeal rejected"},
+            {"title": "PTI says Imran Khan's detention extended"},
+            {"title": "Former Pakistan cricket captain Imran Khan speaks out"},
+            {"title": "Imran Khan, jailed former Pakistani premier, appears in court"},
+        ]
+        for entry in entries:
+            with self.subTest(title=entry["title"]):
+                self.assertTrue(news.is_important(entry, "international"))
+
+    def test_ambiguous_imran_khan_mention_without_identity_cue_is_rejected(self):
+        entry = {
+            "title": "Imran Khan comments on latest developments",
+            "summary": "The interview was published by an international outlet.",
+        }
+        self.assertFalse(news.is_important(entry, "international"))
+
+    def test_explicit_actor_coverage_is_rejected_even_if_summary_mentions_politics(self):
+        entry = {
+            "title": "Bollywood actor Imran Khan on his career",
+            "summary": "The actor briefly commented on Pakistan's former prime minister.",
+        }
+        self.assertFalse(news.is_important(entry, "international"))
+
     def test_url_normalization_removes_tracking_and_fragments(self):
         first = news._canonical_url(
             "http://www.example.com/story/123/?utm_source=rss#comments")
