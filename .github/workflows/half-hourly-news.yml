@@ -9,6 +9,10 @@ concurrency:
   group: half-hourly-news
   cancel-in-progress: false
 
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   fetch-and-notify:
     runs-on: ubuntu-latest
@@ -16,6 +20,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Keep scheduled workflow active
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh api --method PUT "/repos/${{ github.repository }}/actions/workflows/half-hourly-news.yml/enable" || true
 
       - name: Restore seen-state
         uses: actions/cache/restore@v4
