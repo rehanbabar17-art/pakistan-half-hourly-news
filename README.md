@@ -1,16 +1,15 @@
 # 🇵🇰 Half-Hourly Pakistan News via ntfy
 
 Automatically collects **important national (Pakistan) and international news**
-every **30 minutes** from Pakistani English-language news websites, then pushes
-them straight to your phone/desktop via [ntfy.sh](https://ntfy.sh) — no app
-store accounts, no email digests, just instant notifications.
+every **30 minutes** from Pakistani English-language news websites and global feeds,
+runs a **7-Step Canonical Event Deduplication & Story Evolution Pipeline**, and
+delivers one notification per real-world event via [ntfy.sh](https://ntfy.sh).
 
 ## 🔒 Privacy note
 
 Your ntfy topic lives in a **GitHub Actions secret** (`NTFY_TOPIC`), never in
 this repo. To create your own topic, pick any random name (e.g.
-`NewsPakistan_` + 10 random chars) — ntfy topic names are public to anyone who
-guesses them, so the longer and more random, the better.
+`NewsPakistan_` + 10 random chars).
 
 ## 📬 Subscribe
 
@@ -24,107 +23,57 @@ Or via CLI:
 curl -s ntfy.sh/<YOUR_TOPIC_NAME>
 ```
 
-## ⚙️ How it works
+## 🧠 7-Step Canonical Story Deduplication & Evolution Workflow
 
-- A **GitHub Actions** workflow runs every 30 minutes (`0,30 * * * *`).
-- `scripts/fetch_news.py` fetches **RSS feeds** from Pakistani English outlets plus
-  Google News RSS (fresher, cross-source coverage):
+For every incoming article, `scripts/fetch_news.py` executes:
 
-| Source | Feed | Scope |
-|---|---|---|
-| Dawn | `dawn.com/feeds/home` | 🇳🇵 National |
-| Business Recorder | Google News `site:brecorder.com` | 🇳🇵 National |
-| Google News | `Pakistan news today` query | 🇳🇵 National |
-| Google News | `Pakistan world news` query | 🌍 International |
-| Google News | `Imran Khan` query (US/UK/IN locale) | 🌍 International |
+### Step 1: Fetch Full Content
+- Opens the original article URL and extracts the complete editorial body (`<p>` paragraphs), not just the RSS title or snippet.
+- Strips navigation elements, advertisements, related links, scripts, and boilerplate wrappers (including Google News aggregator wrappers).
 
-- All timestamps are in **Pakistan Standard Time (PKT / UTC+5)**.
-- **National** articles always pass through; **international** articles must
-  match priority keywords (word-boundary regex, no false positives).
-- Any story mentioning **Imran Khan** must also identify him as Pakistan's
-  former prime minister/cricketer or include a PTI identity cue. Explicit
-  Bollywood/Indian-actor coverage and ambiguous name-only results are filtered,
-  including on national feeds.
+### Step 2: Create Canonical Story Summary & Event Fingerprint
+- Generates:
+  - **Canonical Headline**
+  - **100–150 Word Summary** synthesized from the extracted editorial content
+  - **Key Entities**: People, Organizations, Countries/Locations, Products, and Events
+  - **Key Facts**: What happened, Where it happened, When it happened, Why it matters, and 3 concise bullet points
+  - **One-Sentence Event Fingerprint** describing the underlying real-world event
+  - **128-D Semantic Embedding Vector** representation of the story
 
-### Tracked keywords
+### Step 3: 72-Hour Rolling Story Memory Database
+- Maintains a rolling memory (`seen_articles.json`) containing the Story ID, original headline, canonical summary, key entities, key facts, Event Fingerprint, semantic embedding, and timestamp.
+- **Retention period**: Keeps records for **72 hours** (`SEEN_SCAN_HOURS = 72`) and automatically prunes entries older than 72 hours.
 
-| Category | Keywords |
-|---|---|
-| Telecoms | Telenor, ONIC, Ufone, e&, PTCL, Etisalat, Jazz, Zong |
-| Judiciary | Supreme Court, Lahore High Court, Islamabad High Court, Federal Constitutional Court |
-| Politics | Imran Khan, PTI, Pakistan Tehreek-e-Insaf, Shehbaz, Zardari, Bhutto, Nawaz |
-| Regional & Fuel | Pakistan, Kashmir, Balochistan, CPEC, Parliament, Senate |
-| Fuel Prices | Petrol, Diesel, Fuel Price, Petrol Price, Diesel Price, Petroleum, Petrol Hike, Fuel Relief, Gasoline |
+### Step 4 & Step 5: Multi-Dimensional Duplicate Detection & Thresholds
+Compares each incoming article against all stories stored within the last 72 hours using semantic vector similarity, Event Fingerprint overlap, entity overlap, and fact similarity:
+- **Semantic similarity $\ge 85\%$**: Marked as `DUPLICATE`, suppressed, and logged with source and URL only.
+- **Semantic similarity $70\text{–}84\%$**: Compares key entities, facts, and Event Fingerprint; if the core event is identical, marked as `DUPLICATE` and suppressed.
+- **Semantic similarity $< 70\%$**: Treated as a `NEW STORY`.
 
-### Deduplication
+### Step 6: Story Evolution Handling (`SIGNIFICANT UPDATE`)
+- Distinguishes between redundant duplicates and genuine story updates (e.g., *"Microsoft announces layoffs"* followed later by *"Microsoft confirms 9,000 layoffs and publishes restructuring details"*).
+- When a newer article about a stored event introduces substantially new confirmed figures, outcomes, verdicts, or developments:
+  - Replaces the stored summary and updates the 72-hour memory record
+  - Delivers the updated alert labeled as `SIGNIFICANT UPDATE`
 
-- **Canonical URL dedup**: links are normalized (host casing, `www`, fragments,
-  trailing slashes, and common tracking parameters removed) and checked within
-  a feed, across feeds, and against the saved sent-article cache.
-- **Paraphrase dedup**: normalized content words are compared across headlines;
-  when titles alone are not conclusive, title and RSS-summary fingerprints are
-  compared together. This catches reworded reports from different links while
-  requiring both title and broader-story evidence to avoid suppressing unrelated
-  stories that merely mention the same person or country.
-- **Article-page verification**: after an item passes the time and importance
-  filters, the fetcher opens up to 12 article links per feed, extracts the page
-  title/description/body, and creates a short extractive summary. The extracted
-  body is used as an additional story fingerprint, so two outlets can be
-  skipped even when their RSS headlines are substantially different. Page
-  requests are bounded by a 6-second timeout and failures fall back to RSS data.
-- **Notification summary**: when page extraction succeeds, the ntfy message
-  includes the short page-derived summary above the source link.
-- **Cross-run dedup**: each sent article saves canonical links and title/story
-  fingerprints in the seen-article cache. New-format cache entries are checked
-  by URL, title similarity, and title-plus-summary similarity; older cache
-  entries remain readable. The existing example — "Seven former Australia
-  captains appeal for Imran Khan" vs "Allan Border, Steve Waugh among
-  ex-Australia captains to make humanitarian plea for Imran Khan" — is covered.
-- **Serialized runs**: GitHub Actions allows only one fetch-and-notify run at a
-  time, preventing overlapping jobs from both sending the same uncached story.
-- **Source priority**: when duplicate articles appear in one feed, the more
-  authoritative source wins (Dawn > Business Recorder > GNews).
-- **Per-source cap**: max 5 articles per source per run so one outlet can't flood.
-- **Round-robin interleave** across sources prevents one outlet from dominating
-  the 12-article-per-run cap.
-- A **seen-article cache** (persisted via GitHub Actions cache) carries dedup state
-  across cron runs.
+### Step 7: User Delivery Format
+Only stories classified as `NEW STORY` or `SIGNIFICANT UPDATE` are delivered:
 
-### Reliability
+```text
+Headline
 
-- Every feed is fetched in an isolated child process with a **12s hard kill** — a
-  stalled or throttled source can never hang the run.
-- If the Google News **Imran Khan** feed stalls (intermittent on GitHub runners),
-  a **fallback URL** is tried automatically.
-- Each feed's articles are **sent to ntfy as soon as they're collected**, so a
-  later feed failing/killed never loses news the user has already been sent.
-- An outer **210s watchdog** (`timeout`) kills the whole worker if it ever
-  freezes, so every cron run completes — no infinite/cancelled runs.
+Summary: [100-150 word summary]
 
-## ▶️ Manual run
+Key Facts: • Fact 1 • Fact 2 • Fact 3
 
-From the **Actions** tab, click **Run workflow** to trigger a news push immediately.
+Source: [source name]
 
-## 🔑 Setup
+Published: [timestamp]
 
-1. Fork/clone this repo.
-2. Create a random ntfy topic (e.g. `NewsPakistan_XXXXXXXXXX`) and subscribe to
-   it in the ntfy app.
-3. In GitHub, go to **Settings → Secrets and variables → Actions** and add:
+Story Type: NEW STORY / SIGNIFICANT UPDATE
 
-   | Secret | Value |
-   |---|---|
-   | `NTFY_TOPIC` | your random topic name |
-   | `NTFY_SERVER` | `https://ntfy.sh` (or your self-hosted server) |
-
-4. The workflow runs automatically every 30 minutes.
-
-## 🛠️ Customize
-
-- **Keywords** — edit `HIGH_PRIORITY_KEYWORDS` in `scripts/fetch_news.py`.
-- **Frequency** — edit the `cron` line in `.github/workflows/half-hourly-news.yml`.
-- **Sources** — add/remove entries in the `RSS_FEEDS` list.
-- **Cap** — change `MAX_PER_RUN` (default: 12) to increase/decrease notifications.
+Link: [url]
+```
 
 ## 🚀 Quick start (local)
 

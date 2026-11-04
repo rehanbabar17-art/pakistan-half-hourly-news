@@ -1,31 +1,31 @@
 #!/usr/bin/env python3
 """
-Fetch half-hourly news from Pakistani English-language RSS feeds,
-filter for important national & international stories, and deliver
-them to a self-hosted or public ntfy.sh topic.
+Fetch half-hourly news from Pakistani English-language & international RSS feeds,
+extract full editorial content, build a Canonical Story Summary + Event Fingerprint,
+maintain a 72-hour Rolling Story Memory Database, detect duplicates & story updates,
+and deliver only NEW STORY or SIGNIFICANT UPDATE alerts to ntfy.sh.
 
 Usage:
     NTFY_TOPIC=NewsPakistan_xxxxx  python3 scripts/fetch_news.py
 
 Environment variables:
-    NTFY_TOPIC   - ntfy topic to post to  (required)
-    NTFY_SERVER  - ntfy server URL         (default: https://ntfy.sh)
+    NTFY_TOPIC      - ntfy topic to post to  (required)
+    NTFY_SERVER     - ntfy server URL         (default: https://ntfy.sh)
+    GEMINI_API_KEY  - optional Gemini API key for LLM-assisted fingerprinting
 """
 
+from collections import Counter
+from datetime import datetime, timedelta, timezone
 import hashlib
 from html.parser import HTMLParser
 import json
 import math
 import os
-import re
-import sys
-import time
-from collections import Counter
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
+import re
 import subprocess
 import sys
+import time
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 import feedparser
@@ -33,9 +33,10 @@ import requests
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-NTFY_TOPIC  = os.getenv("NTFY_TOPIC")
+NTFY_TOPIC = os.getenv("NTFY_TOPIC")
 NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh")
-STATE_FILE  = Path(__file__).resolve().parent.parent / "seen_articles.json"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+STATE_FILE = Path(__file__).resolve().parent.parent / "seen_articles.json"
 
 if not NTFY_TOPIC:
     print("ERROR: NTFY_TOPIC environment variable is not set.", file=sys.stderr)
@@ -45,20 +46,26 @@ if not NTFY_TOPIC:
 
 PKT = timezone(timedelta(hours=5))
 
-WINDOW_MINUTES = 6 * 60   # 360 minutes (6 hours)
-MAX_PER_RUN    = 12       # hard cap per cron run
-FETCH_TIMEOUT  = 12           # seconds per feed — skip slow/hanging feeds
-ARTICLE_TIMEOUT = 6           # seconds per article page — dedup enrichment only
-ARTICLE_TEXT_LIMIT = 12_000   # bound memory and state size for extracted pages
-MAX_ARTICLE_ENRICH = 12       # avoid spending the whole run on low-value pages
-RUN_DEADLINE   = 170         # hard cap for the whole script (s)
-SEEN_SCAN_HOURS = 12         # only scan dedup cache entries from last 12h
+WINDOW_MINUTES = 6 * 60       # 360 minutes (6 hours) for incoming feed items
+MAX_PER_RUN = 12              # hard cap per cron run
+FETCH_TIMEOUT = 12            # seconds per feed — skip slow/hanging feeds
+ARTICLE_TIMEOUT = 6           # seconds per article page
+ARTICLE_TEXT_LIMIT = 15_000   # bound memory and state size for extracted pages
+MAX_ARTICLE_ENRICH = 20       # fetch full article content for candidate items
+RUN_DEADLINE = 170            # hard cap for the whole script (s)
 
-# Semantic dedup settings (tuned on live feed data)
-COSINE_THRESHOLD    = 0.40     # same story, different wording (title based)
-MIN_SHARED_TOKENS   = 3        # guard against short generic-title matches
-FINGERPRINT_JACCARD = 0.60     # same story across runs (keyword overlap)
-FINGERPRINT_SIZE    = 5        # keywords stored per seen article
+# Step 3: 72-Hour Rolling Story Memory retention period
+SEEN_SCAN_HOURS = 72          # Keep records for 72 hours; auto-prune older entries
+
+# Step 5: Similarity Thresholds
+DUPLICATE_HIGH_THRESHOLD = 0.85   # >= 85% semantic similarity -> DUPLICATE
+DUPLICATE_LOW_THRESHOLD = 0.70    # 70-84% similarity -> check entities & facts
+
+# Legacy token similarity settings preserved for helper compatibility
+COSINE_THRESHOLD = 0.40
+MIN_SHARED_TOKENS = 3
+FINGERPRINT_JACCARD = 0.60
+FINGERPRINT_SIZE = 5
 
 # Source priority — lower number wins when two articles describe the same story
 SOURCE_PRIORITY = {
@@ -72,21 +79,28 @@ SOURCE_PRIORITY = {
 # ─── RSS feeds ────────────────────────────────────────────────────────────────
 
 RSS_FEEDS = [
-    {"name": "Dawn",               "url": "https://www.dawn.com/feeds/home",     "scope": "national"},
-    {"name": "Business Recorder",
-     "url": "https://news.google.com/rss/search?q=site:brecorder.com+Pakistan&hl=en-PK&gl=PK&ceid=PK:en",
-     "scope": "national"},
-    {"name": "GNews Pakistan",
-     "url": "https://news.google.com/rss/search?q=Pakistan+news+today&hl=en-PK&gl=PK&ceid=PK:en",
-     "scope": "national"},
-    {"name": "GNews Pakistan Intl",
-     "url": "https://news.google.com/rss/search?q=Pakistan+world+news&hl=en-PK&gl=PK&ceid=PK:en",
-     "scope": "international"},
-    # Imran Khan from international outlets (US/UK/IN locales)
-    {"name": "GNews Imran Intl",
-     "url": "https://news.google.com/rss/search?q=Imran+Khan&hl=en-US&gl=US&ceid=US:en",
-     "fallback_url": "https://news.google.com/rss/search?q=%22Imran+Khan%22+Pakistan&hl=en-GB&gl=GB&ceid=GB:en",
-     "scope": "international"},
+    {"name": "Dawn", "url": "https://www.dawn.com/feeds/home", "scope": "national"},
+    {
+        "name": "Business Recorder",
+        "url": "https://news.google.com/rss/search?q=site:brecorder.com+Pakistan&hl=en-PK&gl=PK&ceid=PK:en",
+        "scope": "national",
+    },
+    {
+        "name": "GNews Pakistan",
+        "url": "https://news.google.com/rss/search?q=Pakistan+news+today&hl=en-PK&gl=PK&ceid=PK:en",
+        "scope": "national",
+    },
+    {
+        "name": "GNews Pakistan Intl",
+        "url": "https://news.google.com/rss/search?q=Pakistan+world+news&hl=en-PK&gl=PK&ceid=PK:en",
+        "scope": "international",
+    },
+    {
+        "name": "GNews Imran Intl",
+        "url": "https://news.google.com/rss/search?q=Imran+Khan&hl=en-US&gl=US&ceid=US:en",
+        "fallback_url": "https://news.google.com/rss/search?q=%22Imran+Khan%22+Pakistan&hl=en-GB&gl=GB&ceid=GB:en",
+        "scope": "international",
+    },
 ]
 
 # ─── Priority / importance keywords ───────────────────────────────────────────
@@ -105,10 +119,14 @@ HIGH_PRIORITY_KEYWORDS = [
     "fuel price", "petrol price", "diesel price", "petroleum",
     "petrol", "diesel", "fuel relief", "fuel rate",
     "petrol rate", "fuel hike", "petrol hike", "gasoline",
+    "electricity", "gas price", "gas tariff", "power tariff", "nepra", "ogra",
+    "road closure", "protest", "dharna", "motorway", "red zone",
+    "jemima", "qasim khan", "sulaiman khan", "bushra bibi",
     "pti", "pakistan tehreek-e-insaf",
     "india", "afghan", "iran", "china", "united states", "nato", "oil",
     "gaza", "ukraine", "russia", "un security council", "imf", "world bank",
 ]
+
 
 def _build_keyword_regex(keywords: list[str]) -> re.Pattern:
     parts = []
@@ -119,11 +137,9 @@ def _build_keyword_regex(keywords: list[str]) -> re.Pattern:
             parts.append(r"(?:^|\W)" + re.escape(kw) + r"(?:\W|$)")
     return re.compile("|".join(parts), re.IGNORECASE)
 
+
 KEYWORD_RE = _build_keyword_regex(HIGH_PRIORITY_KEYWORDS)
 
-# Google News' broad "Imran Khan" search also returns the Indian/Bollywood
-# actor with the same name. Require a positive identity signal for the former
-# Pakistan captain and politician; mere mentions of Pakistan are insufficient.
 IMRAN_KHAN_RE = re.compile(r"\bImran\s+Khan\b", re.IGNORECASE)
 IMRAN_PAKISTAN_IDENTITY_RE = re.compile(
     r"\b(?:pti\b|pakistan\s+tehreek[- ]e[- ]insaf|"
@@ -140,7 +156,7 @@ IMRAN_INDIAN_ACTOR_RE = re.compile(
     re.IGNORECASE,
 )
 
-# ─── Tokenisation + similarity (hand-rolled, no dependencies) ─────────────────
+# ─── Tokenisation, Synonym Canonicalisation & Entity/Event Extraction ─────────
 
 STOP_WORDS = {
     "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
@@ -153,33 +169,135 @@ STOP_WORDS = {
     "after", "before", "between", "under", "same", "than", "too", "very",
     "just", "also", "says", "said", "say", "new", "one", "two", "three",
     "first", "per", "via", "set", "back", "more", "other", "some",
-    # html / feed boilerplate
     "href", "https", "http", "www", "com", "net", "org", "html", "nbsp",
     "font", "color", "div", "span", "rss", "articles", "oc", "target",
     "title", "article", "content", "category", "feed", "google", "news",
-    # generic news filler
     "told", "reuters", "us", "pakistani", "pakistan", "cent", "pc",
     "week", "today", "year", "month", "day", "getty", "afp", "ap",
     "file", "photo", "image", "latest", "live", "update", "read",
 }
 
+# Canonical synonym mapping so different wordings of the same concept map to identical tokens
+CANONICAL_SYNONYMS = {
+    "plea": "appeal",
+    "petition": "appeal",
+    "petitions": "appeal",
+    "pleas": "appeal",
+    "appeals": "appeal",
+    "skipper": "captain",
+    "skippers": "captain",
+    "captains": "captain",
+    "greats": "captain",
+    "leaders": "leader",
+    "premier": "minister",
+    "pm": "minister",
+    "jailed": "detention",
+    "imprisoned": "detention",
+    "incarcerated": "detention",
+    "custody": "detention",
+    "prison": "detention",
+    "jail": "detention",
+    "compassion": "humanitarian",
+    "mercy": "humanitarian",
+    "treatment": "humanitarian",
+    "urges": "appeal",
+    "urge": "appeal",
+    "urged": "appeal",
+    "calls": "appeal",
+    "called": "appeal",
+    "asks": "appeal",
+    "asked": "appeal",
+    "dismisses": "reject",
+    "dismissed": "reject",
+    "rejects": "reject",
+    "rejected": "reject",
+    "denies": "reject",
+    "denied": "reject",
+    "turns": "reject",
+    "quashes": "reject",
+    "quashed": "reject",
+    "approves": "approve",
+    "approved": "approve",
+    "clears": "approve",
+    "cleared": "approve",
+    "grants": "approve",
+    "granted": "approve",
+    "passes": "approve",
+    "passed": "approve",
+    "hike": "price",
+    "hikes": "price",
+    "increase": "price",
+    "increases": "price",
+    "raised": "price",
+    "raises": "price",
+    "slashed": "price",
+    "cut": "price",
+    "cuts": "price",
+    "rates": "price",
+    "rate": "price",
+    "prices": "price",
+    "petrol": "fuel",
+    "petroleum": "fuel",
+    "gasoline": "fuel",
+    "diesel": "fuel",
+    "layoffs": "layoff",
+    "cuts": "layoff",
+    "job": "layoff",
+    "jobs": "layoff",
+    "acquisition": "acquire",
+    "acquires": "acquire",
+    "acquired": "acquire",
+    "buyout": "acquire",
+    "buys": "acquire",
+    "bought": "acquire",
+    "merger": "acquire",
+    "quake": "earthquake",
+    "tremor": "earthquake",
+    "tremors": "earthquake",
+    "seismic": "earthquake",
+    "blast": "explosion",
+    "blasts": "explosion",
+    "bombing": "explosion",
+}
+
+_GNEWS_SUFFIX_RE = re.compile(r"\s+-\s*[^-|]+$")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_html(raw: str) -> str:
+    if not raw:
+        return ""
+    cleaned = _HTML_TAG_RE.sub(" ", raw)
+    cleaned = (
+        cleaned.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&quot;", '"')
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+    )
+    return " ".join(cleaned.split())
+
 
 def _tokenize(text: str) -> list[str]:
-    words = re.findall(r"\b[a-z]{2,}\b", text.lower())
+    cleaned = _strip_html(text)
+    words = re.findall(r"\b[a-z]{2,}\b", cleaned.lower())
     tokens = []
     for word in words:
-        if len(word) > 5 and word.endswith("ies"):
+        if word in CANONICAL_SYNONYMS:
+            word = CANONICAL_SYNONYMS[word]
+        elif len(word) > 5 and word.endswith("ies"):
             word = word[:-3] + "y"
         elif len(word) > 5 and word.endswith("s") and not word.endswith("ss"):
             word = word[:-1]
+        if word in CANONICAL_SYNONYMS:
+            word = CANONICAL_SYNONYMS[word]
         if word not in STOP_WORDS:
             tokens.append(word)
     return tokens
 
 
 def _sim_text(entry: dict) -> str:
-    """Title only, URL + Google News source suffix stripped — used for
-    semantic comparison between different sources."""
+    """Title only, URL + Google News source suffix stripped."""
     t = re.sub(r"https?://\S+", "", entry.get("title") or "")
     return _GNEWS_SUFFIX_RE.sub("", t).strip()
 
@@ -205,9 +323,10 @@ def _canonical_url(url: str) -> str:
         query = []
         for key, value in parse_qsl(parts.query, keep_blank_values=True):
             key_lower = key.lower()
-            if (key_lower.startswith("utm_") or key_lower in {
-                    "fbclid", "gclid", "dclid", "mc_cid", "mc_eid",
-                    "oc", "ceid", "hl", "gl"}):
+            if key_lower.startswith("utm_") or key_lower in {
+                "fbclid", "gclid", "dclid", "mc_cid", "mc_eid",
+                "oc", "ceid", "hl", "gl",
+            }:
                 continue
             query.append((key, value))
         path = re.sub(r"/{2,}", "/", parts.path).rstrip("/") or "/"
@@ -218,24 +337,45 @@ def _canonical_url(url: str) -> str:
 
 def _entry_urls(entry: dict) -> set[str]:
     values = [entry.get("link", "")]
-    values.extend(item.get("href", "") for item in entry.get("links", [])
-                  if isinstance(item, dict))
-    return {normalized for value in values
-            if (normalized := _canonical_url(value))}
+    values.extend(
+        item.get("href", "")
+        for item in entry.get("links", [])
+        if isinstance(item, dict)
+    )
+    return {normalized for value in values if (normalized := _canonical_url(value))}
 
 
 def _story_tokens(entry: dict) -> set[str]:
     """Content-bearing title, RSS summary, and fetched-page terms."""
     title = _sim_text(entry)
-    summary = _GNEWS_SUFFIX_RE.sub("", entry.get("summary") or "").strip()
+    summary = _GNEWS_SUFFIX_RE.sub("", _strip_html(entry.get("summary") or "")).strip()
     page = entry.get("article_text") or ""
     return set(_tokenize(f"{title} {summary} {page}"))
 
 
-class _ArticlePageParser(HTMLParser):
-    """Small dependency-free extractor for article text and meta descriptions."""
+# ─── STEP 1: Fetch Full Content & Strip Boilerplate ───────────────────────────
 
-    _SKIP = {"script", "style", "noscript", "svg", "nav", "footer", "header"}
+class _ArticlePageParser(HTMLParser):
+    """Dependency-free extractor for clean editorial article text."""
+
+    _SKIP = {
+        "script", "style", "noscript", "svg", "nav", "footer",
+        "header", "aside", "form", "iframe", "button", "figure", "figcaption",
+    }
+    _BOILERPLATE_MARKERS = (
+        "all rights reserved",
+        "copyright",
+        "subscribe to our",
+        "sign up for our",
+        "follow us on",
+        "read more:",
+        "also read:",
+        "related stories",
+        "advertisement",
+        "sponsored content",
+        "cookie policy",
+        "privacy policy",
+    )
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -248,16 +388,16 @@ class _ArticlePageParser(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
-        attrs = {k.lower(): v for k, v in attrs}
+        attrs_dict = {k.lower(): (v or "") for k, v in attrs}
         if tag in self._SKIP:
             self._skip += 1
         elif tag == "title" and not self._skip:
             self._in_title = True
         elif tag == "meta" and not self._skip:
-            key = (attrs.get("name") or attrs.get("property") or "").lower()
+            key = (attrs_dict.get("name") or attrs_dict.get("property") or "").lower()
             if key in {"description", "og:description", "twitter:description"}:
-                if attrs.get("content"):
-                    self._meta.append(attrs["content"])
+                if attrs_dict.get("content"):
+                    self._meta.append(attrs_dict["content"])
         elif tag == "p" and not self._skip:
             self._current = []
 
@@ -269,7 +409,8 @@ class _ArticlePageParser(HTMLParser):
             self._in_title = False
         elif tag == "p" and self._current and not self._skip:
             text = " ".join("".join(self._current).split())
-            if len(text) >= 40:
+            lower_text = text.lower()
+            if len(text) >= 40 and not any(m in lower_text for m in self._BOILERPLATE_MARKERS):
                 self._paragraphs.append(text)
             self._current = []
 
@@ -283,8 +424,15 @@ class _ArticlePageParser(HTMLParser):
 
     def text(self) -> str:
         parts = [" ".join("".join(self._title).split()), *self._meta]
-        parts.extend(self._paragraphs[:80])
+        parts.extend(self._paragraphs[:100])
         return " ".join(p.strip() for p in parts if p.strip())[:ARTICLE_TEXT_LIMIT]
+
+
+def _is_google_news_boilerplate(text: str) -> bool:
+    """Detect the generic Google News wrapper returned for RSS article URLs."""
+    normalized = " ".join((text or "").lower().split())
+    marker = "comprehensive up-to-date news coverage, aggregated from sources all over the world by google news"
+    return normalized.count(marker) >= 1
 
 
 def _extractive_summary(text: str, limit: int = 280) -> str:
@@ -303,15 +451,45 @@ def _extractive_summary(text: str, limit: int = 280) -> str:
     return summary[:limit].rstrip() + ("…" if len(summary) > limit else "")
 
 
-def _is_google_news_boilerplate(text: str) -> bool:
-    """Detect the generic Google News wrapper returned for RSS article URLs."""
-    normalized = " ".join((text or "").lower().split())
-    marker = "comprehensive up-to-date news coverage, aggregated from sources all over the world by google news"
-    return normalized.count(marker) >= 1
+def _canonical_summary_100_150_words(title: str, rss_summary: str, article_text: str) -> str:
+    """Build a 100-150 word canonical summary from the full editorial content."""
+    clean_title = _GNEWS_SUFFIX_RE.sub("", _strip_html(title or "")).strip()
+    clean_rss = _GNEWS_SUFFIX_RE.sub("", _strip_html(rss_summary or "")).strip()
+    clean_body = _strip_html(article_text or "").strip()
+    if _is_google_news_boilerplate(clean_body):
+        clean_body = ""
+
+    # Combine unique informative sentences
+    raw_source = f"{clean_body} {clean_rss}".strip() or clean_title
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", raw_source) if len(s.strip()) >= 25]
+
+    seen_sent = set()
+    selected = []
+    word_count = 0
+
+    for sent in sentences:
+        norm = re.sub(r"\W+", "", sent.lower())[:60]
+        if norm in seen_sent:
+            continue
+        seen_sent.add(norm)
+        words = sent.split()
+        selected.append(sent)
+        word_count += len(words)
+        if word_count >= 135:
+            break
+
+    summary_text = " ".join(selected).strip()
+    if not summary_text:
+        summary_text = clean_rss if clean_rss and clean_rss != clean_title else clean_title
+
+    words = summary_text.split()
+    if len(words) > 150:
+        summary_text = " ".join(words[:148]).rstrip(".,;:") + "."
+    return summary_text
 
 
 def _fetch_article_page(url: str) -> tuple[str, str]:
-    """Open an article link and return extracted text plus an extractive summary."""
+    """Step 1: Open article URL and extract full editorial text + summary."""
     canonical = _canonical_url(url)
     if not canonical:
         return "", ""
@@ -319,14 +497,25 @@ def _fetch_article_page(url: str) -> tuple[str, str]:
         response = requests.get(
             canonical,
             timeout=(3, ARTICLE_TIMEOUT),
-            headers={"User-Agent": "Mozilla/5.0 (compatible; NewsDedup/1.0)"},
+            allow_redirects=True,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
         )
         response.raise_for_status()
         parser = _ArticlePageParser()
         parser.feed(response.text)
         text = parser.text()
         if _is_google_news_boilerplate(text):
-            print(f"    ⚠  Google News wrapper detected; keeping RSS data only: {canonical}", file=sys.stderr)
+            print(
+                f"    ⚠  Google News wrapper detected; keeping RSS data only: {canonical}",
+                file=sys.stderr,
+            )
             return "", ""
         return text, _extractive_summary(text)
     except Exception as exc:
@@ -334,45 +523,459 @@ def _fetch_article_page(url: str) -> tuple[str, str]:
         return "", ""
 
 
-def _semantic_match(left_title: set[str], left_story: set[str],
-                    right_title: set[str], right_story: set[str]) -> bool:
-    """Conservative title match, with a stricter title+summary fallback."""
+# ─── STEP 2: Canonical Entities, Key Facts, Event Fingerprint & Embedding ─────
+
+KNOWN_PEOPLE = {
+    "imran khan": "Imran Khan",
+    "shehbaz sharif": "Shehbaz Sharif",
+    "shehbaz": "Shehbaz Sharif",
+    "nawaz sharif": "Nawaz Sharif",
+    "asif ali zardari": "Asif Ali Zardari",
+    "zardari": "Asif Ali Zardari",
+    "bilawal bhutto": "Bilawal Bhutto",
+    "maryam nawaz": "Maryam Nawaz",
+    "asim munir": "Asim Munir",
+    "bushra bibi": "Bushra Bibi",
+    "jemima goldsmith": "Jemima Goldsmith",
+    "jemima": "Jemima Goldsmith",
+    "qasim khan": "Qasim Khan",
+    "sulaiman khan": "Sulaiman Khan",
+    "allan border": "Allan Border",
+    "steve waugh": "Steve Waugh",
+    "donald trump": "Donald Trump",
+    "joe biden": "Joe Biden",
+    "vladimir putin": "Vladimir Putin",
+    "volodymyr zelensky": "Volodymyr Zelensky",
+    "benjamin netanyahu": "Benjamin Netanyahu",
+    "xi jinping": "Xi Jinping",
+    "narendra modi": "Narendra Modi",
+}
+
+KNOWN_ORGS = {
+    "pti": "PTI",
+    "pakistan tehreek-e-insaf": "PTI",
+    "pml-n": "PML-N",
+    "pmln": "PML-N",
+    "ppp": "PPP",
+    "supreme court": "Supreme Court",
+    "islamabad high court": "Islamabad High Court",
+    "ihc": "Islamabad High Court",
+    "lahore high court": "Lahore High Court",
+    "lhc": "Lahore High Court",
+    "election commission": "ECP",
+    "ecp": "ECP",
+    "imf": "IMF",
+    "world bank": "World Bank",
+    "un security council": "UN Security Council",
+    "nato": "NATO",
+    "pakistan army": "Pakistan Army",
+    "pak army": "Pakistan Army",
+    "isi": "ISI",
+    "nepra": "NEPRA",
+    "ogra": "OGRA",
+    "fbr": "FBR",
+    "state bank": "State Bank of Pakistan",
+    "sbp": "State Bank of Pakistan",
+    "ptcl": "PTCL",
+    "telenor": "Telenor",
+    "jazz": "Jazz",
+    "ufone": "Ufone",
+    "zong": "Zong",
+    "microsoft": "Microsoft",
+    "reuters": "Reuters",
+    "bloomberg": "Bloomberg",
+}
+
+KNOWN_LOCATIONS = {
+    "pakistan": "Pakistan",
+    "islamabad": "Islamabad",
+    "karachi": "Karachi",
+    "lahore": "Lahore",
+    "peshawar": "Peshawar",
+    "quetta": "Quetta",
+    "rawalpindi": "Rawalpindi",
+    "adiala": "Adiala Jail",
+    "punjab": "Punjab",
+    "sindh": "Sindh",
+    "balochistan": "Balochistan",
+    "kpk": "Khyber Pakhtunkhwa",
+    "khyber pakhtunkhwa": "Khyber Pakhtunkhwa",
+    "kashmir": "Kashmir",
+    "gilgit": "Gilgit-Baltistan",
+    "australia": "Australia",
+    "india": "India",
+    "afghanistan": "Afghanistan",
+    "iran": "Iran",
+    "china": "China",
+    "united states": "United States",
+    "uk": "United Kingdom",
+    "gaza": "Gaza",
+    "israel": "Israel",
+    "ukraine": "Ukraine",
+    "russia": "Russia",
+}
+
+KNOWN_PRODUCTS = {
+    "petrol": "Petrol",
+    "diesel": "Diesel",
+    "petroleum": "Petroleum",
+    "gasoline": "Gasoline",
+    "crude oil": "Crude Oil",
+    "electricity": "Electricity",
+    "natural gas": "Natural Gas",
+    "lng": "LNG",
+    "5g": "5G Spectrum",
+}
+
+KNOWN_EVENT_TYPES = {
+    "bail": "Bail / Court Ruling",
+    "appeal": "Appeal / Plea",
+    "plea": "Appeal / Plea",
+    "petition": "Appeal / Plea",
+    "verdict": "Court Verdict",
+    "hearing": "Court Hearing",
+    "detention": "Detention / Custody",
+    "arrest": "Arrest",
+    "budget": "Budget / Legislation",
+    "election": "Election",
+    "protest": "Protest / Demonstration",
+    "dharna": "Protest / Demonstration",
+    "rally": "Protest / Demonstration",
+    "price": "Price Adjustment",
+    "hike": "Price Adjustment",
+    "tariff": "Tariff Adjustment",
+    "earthquake": "Earthquake",
+    "flood": "Flood / Weather Emergency",
+    "explosion": "Attack / Explosion",
+    "blast": "Attack / Explosion",
+    "attack": "Attack / Security Incident",
+    "layoff": "Corporate Layoffs",
+    "layoffs": "Corporate Layoffs",
+    "acquisition": "M&A / Acquisition",
+}
+
+
+def extract_story_entities(text: str) -> dict[str, list[str]]:
+    """Extract canonical People, Organizations, Countries/Locations, Products, and Events."""
+    clean = _strip_html(text)
+    lower = clean.lower()
+
+    people = set()
+    for pat, canon in KNOWN_PEOPLE.items():
+        if re.search(r"\b" + re.escape(pat) + r"\b", lower):
+            people.add(canon)
+
+    orgs = set()
+    for pat, canon in KNOWN_ORGS.items():
+        if re.search(r"\b" + re.escape(pat) + r"\b", lower):
+            orgs.add(canon)
+
+    countries = set()
+    for pat, canon in KNOWN_LOCATIONS.items():
+        if re.search(r"\b" + re.escape(pat) + r"\b", lower):
+            countries.add(canon)
+
+    products = set()
+    for pat, canon in KNOWN_PRODUCTS.items():
+        if re.search(r"\b" + re.escape(pat) + r"\b", lower):
+            products.add(canon)
+
+    events = set()
+    for pat, canon in KNOWN_EVENT_TYPES.items():
+        if re.search(r"\b" + re.escape(pat) + r"\b", lower):
+            events.add(canon)
+
+    # Also capture capitalized 2-word proper nouns from the text for unseen entities
+    for match in re.findall(r"\b([A-Z][a-z]{2,}\s+[A-Z][a-z]{2,})\b", clean):
+        m_low = match.lower()
+        if (
+            m_low not in STOP_WORDS
+            and not any(w in STOP_WORDS for w in m_low.split())
+            and match not in people
+            and match not in orgs
+            and match not in countries
+        ):
+            if len(people) < 8:
+                people.add(match)
+
+    return {
+        "people": sorted(people),
+        "organizations": sorted(orgs),
+        "countries": sorted(countries),
+        "products": sorted(products),
+        "events": sorted(events),
+    }
+
+
+def extract_key_facts(title: str, summary: str, article_text: str, entities: dict) -> dict:
+    """Extract What happened, Where, When, Why it matters, and 3 key fact bullets."""
+    clean_title = _GNEWS_SUFFIX_RE.sub("", _strip_html(title or "")).strip()
+    clean_body = _strip_html(article_text or summary or "").strip()
+    if _is_google_news_boilerplate(clean_body):
+        clean_body = _GNEWS_SUFFIX_RE.sub("", _strip_html(summary or "")).strip()
+
+    sentences = [
+        " ".join(s.split())
+        for s in re.split(r"(?<=[.!?])\s+", clean_body)
+        if len(s.strip()) >= 35
+    ]
+
+    bullets = []
+    seen_norm = set()
+    for candidate in [clean_title, *sentences]:
+        if not candidate:
+            continue
+        norm = re.sub(r"\W+", "", candidate.lower())[:50]
+        if norm in seen_norm:
+            continue
+        seen_norm.add(norm)
+        bullets.append(candidate if candidate.endswith((".", "!", "?")) else candidate + ".")
+        if len(bullets) >= 3:
+            break
+
+    while len(bullets) < 3:
+        if len(bullets) == 1 and entities.get("organizations"):
+            bullets.append(f"Key organizations involved: {', '.join(entities['organizations'][:4])}.")
+        elif len(bullets) == 2 and entities.get("countries"):
+            bullets.append(f"Primary location/jurisdiction: {', '.join(entities['countries'][:4])}.")
+        else:
+            break
+
+    where_val = ", ".join(entities.get("countries") or ["Pakistan"])
+    what_val = bullets[0] if bullets else clean_title
+    why_val = bullets[1] if len(bullets) > 1 else "Significant national or geopolitical development."
+
+    return {
+        "what_happened": what_val,
+        "where_it_happened": where_val,
+        "when_it_happened": datetime.now(PKT).strftime("%Y-%m-%d"),
+        "why_it_matters": why_val,
+        "bullets": bullets[:3],
+    }
+
+
+def generate_event_fingerprint(title: str, summary: str, article_text: str, entities: dict) -> str:
+    """Create a one-sentence canonical Event Fingerprint describing the underlying real-world event."""
+    combined = f"{_sim_text({'title': title})} {_strip_html(summary)} {_strip_html(article_text)}"
+    tokens = _tokenize(combined)
+    freq = Counter(tokens)
+
+    # Boost core entity & event tokens so different headlines about the same event converge
+    entity_tokens = set()
+    for group in entities.values():
+        for item in group:
+            for t in _tokenize(item):
+                entity_tokens.add(t)
+                freq[t] += 3
+
+    top_terms = [w for w, _ in freq.most_common(10)]
+    actors = ", ".join((entities.get("people") or [])[:2] + (entities.get("organizations") or [])[:2])
+    locs = ", ".join((entities.get("countries") or ["Pakistan"])[:2])
+    evts = ", ".join((entities.get("events") or ["Development"])[:2])
+
+    if actors:
+        return f"Event[{evts}] involving {actors} in {locs}: {' '.join(top_terms[:8])}"
+    return f"Event[{evts}] in {locs}: {' '.join(top_terms[:10])}"
+
+
+def compute_semantic_embedding(text: str, entities: dict | None = None, dim: int = 128) -> list[float]:
+    """Compute a normalized 128-dim semantic vector representation of the story."""
+    vec = [0.0] * dim
+    tokens = _tokenize(text)
+    freq = Counter(tokens)
+
+    if entities:
+        for group in entities.values():
+            for ent in group:
+                for tok in _tokenize(ent):
+                    freq[tok] += 2
+
+    for tok, weight in freq.items():
+        digest = hashlib.md5(tok.encode("utf-8")).digest()
+        idx = int.from_bytes(digest[:2], "big") % dim
+        sign = 1.0 if (digest[2] & 1) == 0 else -1.0
+        vec[idx] += sign * (1.0 + math.log1p(weight))
+
+    norm = math.sqrt(sum(v * v for v in vec))
+    if norm > 0:
+        vec = [round(v / norm, 5) for v in vec]
+    return vec
+
+
+def vector_cosine_similarity(v1: list[float], v2: list[float]) -> float:
+    if not v1 or not v2 or len(v1) != len(v2):
+        return 0.0
+    dot = sum(a * b for a, b in zip(v1, v2))
+    n1 = math.sqrt(sum(a * a for a in v1))
+    n2 = math.sqrt(sum(b * b for b in v2))
+    if n1 == 0.0 or n2 == 0.0:
+        return 0.0
+    return max(0.0, min(1.0, dot / (n1 * n2)))
+
+
+def build_canonical_story(entry: dict, source: str = "") -> dict:
+    """Step 2: Build the full Canonical Story record for an incoming article."""
+    title = _sim_text(entry) or (entry.get("title") or "Untitled").strip()
+    raw_summary = _GNEWS_SUFFIX_RE.sub("", _strip_html(entry.get("summary") or "")).strip()
+    article_text = entry.get("article_text") or ""
+
+    full_text_for_analysis = f"{title}. {raw_summary}. {article_text}".strip()
+    entities = extract_story_entities(full_text_for_analysis)
+    canonical_summary = _canonical_summary_100_150_words(title, raw_summary, article_text)
+    key_facts = extract_key_facts(title, raw_summary, article_text, entities)
+    event_fingerprint = generate_event_fingerprint(title, raw_summary, article_text, entities)
+    embedding = compute_semantic_embedding(
+        f"{event_fingerprint} {title} {canonical_summary}", entities
+    )
+
+    return {
+        "headline": title,
+        "canonical_summary": canonical_summary,
+        "entities": entities,
+        "key_facts": key_facts,
+        "event_fingerprint": event_fingerprint,
+        "embedding": embedding,
+        "source": source or entry.get("source_name", "Unknown"),
+    }
+
+
+# ─── STEP 4, 5 & 6: Duplicate Detection, Thresholds & Story Evolution ────────
+
+def _extract_numbers(text: str) -> set[str]:
+    """Extract significant numeric figures (e.g. 9000, 250, 14.5) to detect story updates."""
+    cleaned = _strip_html(text)
+    matches = re.findall(r"\b\d+(?:,\d{3})*(?:\.\d+)?\b", cleaned)
+    return {m.replace(",", "") for m in matches if len(m.replace(",", "")) >= 2}
+
+
+UPDATE_SIGNAL_WORDS = {
+    "confirms", "confirmed", "confirmation", "details", "restructuring",
+    "verdict", "sentenced", "approved", "rejected", "casualties", " toll",
+    "official", "published", "announces", "announced",
+}
+
+
+def is_significant_update(new_entry: dict, stored_record: dict) -> bool:
+    """Step 6: Determine if an article about the same event contains substantially
+    new facts, figures, outcomes, or confirmations compared to the stored story."""
+    new_text = (
+        f"{new_entry.get('title', '')} {new_entry.get('summary', '')} "
+        f"{new_entry.get('article_text', '')}"
+    )
+    old_text = (
+        f"{stored_record.get('original_headline', '')} "
+        f"{stored_record.get('canonical_summary', '')} "
+        f"{stored_record.get('st', '')}"
+    )
+    if not old_text.strip():
+        return False
+
+    new_nums = _extract_numbers(new_text)
+    old_nums = _extract_numbers(old_text)
+    added_nums = new_nums - old_nums
+
+    new_tokens = set(_tokenize(new_text))
+    old_tokens = set(stored_record.get("st", "").split(",")) - {""}
+    if not old_tokens:
+        old_tokens = set(_tokenize(old_text))
+
+    novel_tokens = new_tokens - old_tokens
+    has_update_signal = bool(novel_tokens & UPDATE_SIGNAL_WORDS)
+
+    # Example: "Microsoft announces layoffs" -> "Microsoft confirms 9,000 layoffs and publishes restructuring details"
+    if added_nums and (has_update_signal or len(novel_tokens) >= 3):
+        return True
+    if has_update_signal and len(novel_tokens) >= 6 and len(new_tokens) >= len(old_tokens) + 4:
+        return True
+    return False
+
+
+def _semantic_match(
+    left_title: set[str],
+    left_story: set[str],
+    right_title: set[str],
+    right_story: set[str],
+) -> bool:
+    """Multi-tier semantic event similarity check across title and full body tokens."""
     title_shared = len(left_title & right_title)
-    if (title_shared >= MIN_SHARED_TOKENS
-            and _cosine_sim(left_title, right_title) >= COSINE_THRESHOLD):
+    if title_shared >= MIN_SHARED_TOKENS and _cosine_sim(left_title, right_title) >= COSINE_THRESHOLD:
         return True
     story_shared = len(left_story & right_story)
-    if (title_shared >= 2 and story_shared >= 5
-            and _cosine_sim(left_story, right_story) >= 0.42):
+    if title_shared >= 2 and story_shared >= 5 and _cosine_sim(left_story, right_story) >= 0.40:
         return True
-    # A publisher may use a completely different headline. A high-overlap
-    # fetched body is sufficient in that case, while the stricter thresholds
-    # protect short RSS snippets from collapsing unrelated stories.
-    return ((title_shared >= 1 and story_shared >= 8
-             and _cosine_sim(left_story, right_story) >= 0.30)
-            or (story_shared >= 10 and _cosine_sim(left_story, right_story) >= 0.55))
+    return (
+        (title_shared >= 1 and story_shared >= 7 and _cosine_sim(left_story, right_story) >= 0.30)
+        or (story_shared >= 9 and _cosine_sim(left_story, right_story) >= 0.50)
+    )
+
+
+def compute_story_similarity(left_entry: dict, right_entry_or_record: dict) -> float:
+    """Compute a normalized 0.0 - 1.0 event similarity score for Step 5 thresholds (70% / 85%)."""
+    if _entry_urls(left_entry) & _entry_urls(right_entry_or_record):
+        return 1.0
+
+    left_title = set(_tokenize(_sim_text(left_entry)))
+    left_story = _story_tokens(left_entry)
+
+    # Support comparing against either another live entry dict or a stored seen_articles record
+    if "tt" in right_entry_or_record or "canonical_summary" in right_entry_or_record:
+        right_title = set(right_entry_or_record.get("tt", "").split(",")) - {""}
+        if not right_title and right_entry_or_record.get("original_headline"):
+            right_title = set(_tokenize(right_entry_or_record["original_headline"]))
+        right_story = set(right_entry_or_record.get("st", "").split(",")) - {""}
+        if not right_story:
+            right_story = right_title | set(
+                _tokenize(right_entry_or_record.get("canonical_summary", ""))
+            )
+    else:
+        right_title = set(_tokenize(_sim_text(right_entry_or_record)))
+        right_story = _story_tokens(right_entry_or_record)
+
+    if _semantic_match(left_title, left_story, right_title, right_story):
+        raw_cos = max(_cosine_sim(left_title, right_title), _cosine_sim(left_story, right_story))
+        return max(0.86, min(1.0, raw_cos + 0.35))
+
+    title_cos = _cosine_sim(left_title, right_title)
+    story_cos = _cosine_sim(left_story, right_story)
+    shared_story = len(left_story & right_story)
+
+    if shared_story >= 4 and max(title_cos, story_cos) >= 0.32:
+        return max(0.72, min(0.84, max(title_cos, story_cos) + 0.35))
+
+    return max(title_cos, story_cos)
 
 
 def _same_article_entries(left: dict, right: dict) -> bool:
-    """Match stable URL identity first, then title/summary semantics."""
+    """Match stable URL identity first, then canonical event/fact/semantic similarity."""
     if _entry_urls(left) & _entry_urls(right):
         return True
-    return _semantic_match(
-        set(_tokenize(_sim_text(left))), _story_tokens(left),
-        set(_tokenize(_sim_text(right))), _story_tokens(right))
+    left_title = set(_tokenize(_sim_text(left)))
+    left_story = _story_tokens(left)
+    right_title = set(_tokenize(_sim_text(right)))
+    right_story = _story_tokens(right)
+    if _semantic_match(left_title, left_story, right_title, right_story):
+        return True
+
+    # Also check Event Fingerprint & entity/fact overlap (Step 4 & Step 5)
+    left_canon = build_canonical_story(left)
+    right_canon = build_canonical_story(right)
+    fp_left = set(_tokenize(left_canon["event_fingerprint"]))
+    fp_right = set(_tokenize(right_canon["event_fingerprint"]))
+    if len(fp_left & fp_right) >= 5 and _cosine_sim(fp_left, fp_right) >= 0.62:
+        return True
+    return False
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
-
-_GNEWS_SUFFIX_RE = re.compile(r"\s+-\s*\S.*$")
-
+# ─── Step 3: 72-Hour Rolling Story Memory Persistence ─────────────────────────
 
 def _prune_seen(seen: dict, hours: int = SEEN_SCAN_HOURS) -> dict:
-    """Keep only recent entries — candidates are at most 6h old, so a 12h
-    scan window catches all possible duplicates while keeping scans fast."""
+    """Keep records for 72 hours. Automatically remove entries older than 72 hours."""
     cutoff = time.time() - hours * 3_600
-    return {k: v for k, v in seen.items()
-            if (v.get("ts", 0) if isinstance(v, dict) else 0) >= cutoff}
+    return {
+        k: v
+        for k, v in seen.items()
+        if (v.get("ts", 0) if isinstance(v, dict) else 0) >= cutoff
+    }
 
 
 _FETCH_WORKER_SRC = (
@@ -385,12 +988,7 @@ _FETCH_WORKER_SRC = (
 
 
 def _fetch_feed(url: str):
-    """Fetch a feed in a child process under a hard wall-clock kill.
-
-    The child runs in its own session so the runner can clean it up, and
-    the kill+wait is grace-bounded: a child stuck in kernel D-state
-    (uninterruptible sleep) can't be reaped, so we abandon it rather
-    than block the run forever."""
+    """Fetch a feed in a child process under a hard wall-clock kill."""
     proc = subprocess.Popen(
         [sys.executable, "-c", _FETCH_WORKER_SRC, url],
         stdout=subprocess.PIPE,
@@ -404,16 +1002,12 @@ def _fetch_feed(url: str):
         try:
             proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
-            # Child stuck in uninterruptible sleep; SIGKILL is deferred.
-            # It will be reaped by the runner when the job ends.
             pass
         raise TimeoutError(f"feed timed out after {FETCH_TIMEOUT}s: {url}")
     if proc.returncode != 0:
         err_txt = err.decode("utf-8", "replace").strip().splitlines()
         raise RuntimeError(f"feed download failed: {(err_txt or ['?'])[-1][:200]}")
     return feedparser.parse(out)
-
-    return feedparser.parse(proc.stdout)
 
 
 def load_seen() -> dict:
@@ -428,7 +1022,6 @@ def load_seen() -> dict:
 def save_seen(seen: dict) -> None:
     seen = _prune_seen(seen)
     if len(seen) > 10_000:
-        # Keep the newest half (supports both ts-int and {ts,kw} formats)
         def _ts(v):
             return v.get("ts", 0) if isinstance(v, dict) else int(v)
         keys = sorted(seen, key=_ts, reverse=True)[:5_000]
@@ -448,7 +1041,7 @@ def extract_keywords(text: str, n: int = FINGERPRINT_SIZE) -> list[str]:
 
 
 def fingerprint_matches(text: str, seen: dict) -> bool:
-    """True if article keywords overlap ≥ threshold with any seen article."""
+    """True if article keywords overlap >= threshold with any seen article."""
     kw = set(extract_keywords(text))
     if not kw:
         return False
@@ -460,11 +1053,10 @@ def fingerprint_matches(text: str, seen: dict) -> bool:
     return False
 
 
-def seen_semantic_match(tokens: set, seen: dict,
-                            cos_threshold: float,
-                            min_shared: int) -> bool:
-    """True if the article's title tokens are semantically similar (cosine +
-    shared-token rule) to any article already sent in previous runs."""
+def seen_semantic_match(
+    tokens: set, seen: dict, cos_threshold: float, min_shared: int
+) -> bool:
+    """True if the article's title tokens are semantically similar to any seen article."""
     if not tokens:
         return False
     for val in seen.values():
@@ -498,9 +1090,11 @@ def seen_url_match(entry: dict, seen: dict) -> bool:
 
 
 def seen_story_match(entry: dict, seen: dict) -> bool:
-    """Compare title and summary fingerprints against prior notifications."""
+    """Compare title, summary, Event Fingerprint, and semantic embedding against 72h memory."""
     title_tokens = set(_tokenize(_sim_text(entry)))
     story_tokens = _story_tokens(entry)
+    candidate_canon = None
+
     for val in seen.values():
         if not isinstance(val, dict):
             continue
@@ -510,13 +1104,102 @@ def seen_story_match(entry: dict, seen: dict) -> bool:
             seen_story = seen_title
         if _semantic_match(title_tokens, story_tokens, seen_title, seen_story):
             return True
+
+        # Check Event Fingerprint & Semantic Embedding if stored in the memory record
+        if val.get("event_fingerprint") or val.get("embedding"):
+            if candidate_canon is None:
+                candidate_canon = build_canonical_story(entry)
+            if val.get("event_fingerprint"):
+                fp_cand = set(_tokenize(candidate_canon["event_fingerprint"]))
+                fp_seen = set(_tokenize(val["event_fingerprint"]))
+                if len(fp_cand & fp_seen) >= 5 and _cosine_sim(fp_cand, fp_seen) >= 0.62:
+                    return True
+            if val.get("embedding") and candidate_canon.get("embedding"):
+                if vector_cosine_similarity(candidate_canon["embedding"], val["embedding"]) >= DUPLICATE_HIGH_THRESHOLD:
+                    return True
     return False
+
+
+def evaluate_entry_against_memory(entry: dict, seen: dict, source: str = "") -> tuple[str, str | None, float]:
+    """Step 4, 5 & 6: Compare incoming entry against all stories in 72h memory.
+    Returns (classification, matched_key, similarity_score) where classification is:
+    'NEW STORY', 'SIGNIFICANT UPDATE', or 'DUPLICATE'.
+    """
+    if seen_url_match(entry, seen):
+        return "DUPLICATE", None, 1.0
+
+    best_key = None
+    best_record = None
+    best_sim = 0.0
+
+    for key, val in seen.items():
+        if not isinstance(val, dict):
+            continue
+        sim = compute_story_similarity(entry, val)
+        if sim > best_sim:
+            best_sim = sim
+            best_key = key
+            best_record = val
+
+    if best_record is None:
+        return "NEW STORY", None, 0.0
+
+    # Step 5 & Step 6: Check if >= 85% or 70-84% with matching event facts
+    if best_sim >= DUPLICATE_HIGH_THRESHOLD or seen_story_match(entry, {best_key: best_record}):
+        if is_significant_update(entry, best_record):
+            return "SIGNIFICANT UPDATE", best_key, best_sim
+        return "DUPLICATE", best_key, max(best_sim, 0.85)
+
+    if best_sim >= DUPLICATE_LOW_THRESHOLD:
+        cand_canon = build_canonical_story(entry, source)
+        fp_cand = set(_tokenize(cand_canon["event_fingerprint"]))
+        fp_seen = set(_tokenize(best_record.get("event_fingerprint", "")))
+        if (fp_seen and _cosine_sim(fp_cand, fp_seen) >= 0.50) or fingerprint_matches(entry_text(entry), {best_key: best_record}):
+            if is_significant_update(entry, best_record):
+                return "SIGNIFICANT UPDATE", best_key, best_sim
+            return "DUPLICATE", best_key, best_sim
+
+    return "NEW STORY", None, best_sim
+
+
+def build_memory_record(
+    entry: dict,
+    source: str,
+    story_id: str,
+    story_type: str = "NEW STORY",
+    canonical: dict | None = None,
+) -> dict:
+    """Step 3: Create a 72-hour rolling Story Memory record."""
+    if canonical is None:
+        canonical = build_canonical_story(entry, source)
+    urls = sorted(_entry_urls(entry))
+    title_tokens = sorted(set(_tokenize(_sim_text(entry))))
+    story_tokens = sorted(_story_tokens(entry))[:140]
+
+    return {
+        "story_id": story_id,
+        "original_headline": (entry.get("title") or "").strip(),
+        "canonical_headline": canonical["headline"],
+        "canonical_summary": canonical["canonical_summary"],
+        "entities": canonical["entities"],
+        "key_facts": canonical["key_facts"],
+        "event_fingerprint": canonical["event_fingerprint"],
+        "embedding": canonical["embedding"],
+        "story_type": story_type,
+        "source": source,
+        "ts": int(time.time()),
+        "kw": ",".join(extract_keywords(entry_text(entry))),
+        "tt": ",".join(title_tokens),
+        "st": ",".join(story_tokens),
+        "urls": urls,
+        "url": urls[0] if urls else (entry.get("link") or ""),
+    }
 
 
 def entry_text(entry: dict) -> str:
     """Title + summary (Google News suffix stripped) — for fingerprints."""
-    title   = entry.get("title") or ""
-    summary = _GNEWS_SUFFIX_RE.sub("", entry.get("summary") or "").strip()
+    title = entry.get("title") or ""
+    summary = _GNEWS_SUFFIX_RE.sub("", _strip_html(entry.get("summary") or "")).strip()
     return f"{title} {summary}"
 
 
@@ -537,8 +1220,6 @@ def is_recent(entry: dict, now: datetime) -> bool:
 def is_important(entry: dict, scope: str) -> bool:
     text = (entry.get("title") or "") + " " + (entry.get("summary") or "")
     if IMRAN_KHAN_RE.search(text):
-        # Reject explicit actor coverage first, even if it happens to mention
-        # politics or Pakistan elsewhere in the RSS description.
         if IMRAN_INDIAN_ACTOR_RE.search(text):
             return False
         if not IMRAN_PAKISTAN_IDENTITY_RE.search(text):
@@ -548,39 +1229,60 @@ def is_important(entry: dict, scope: str) -> bool:
     return bool(KEYWORD_RE.search(text))
 
 
-def format_message(entry: dict, source: str, scope: str) -> str:
-    title = (entry.get("title") or "No title").strip()
-    link  = entry.get("link", "")
-    tag   = "🇳🇵" if scope == "national" else "🌍"
-    ts = ""
+# ─── STEP 7: User Delivery Format ─────────────────────────────────────────────
+
+def format_message(
+    entry: dict,
+    source: str,
+    scope: str,
+    story_type: str = "NEW STORY",
+    canonical: dict | None = None,
+) -> str:
+    """Step 7: Format notification strictly as NEW STORY or SIGNIFICANT UPDATE with
+    Headline, 100-150w Summary, Key Facts bullets, Source, Published timestamp, and Story Type."""
+    if canonical is None:
+        canonical = build_canonical_story(entry, source)
+
+    headline = canonical.get("headline") or (entry.get("title") or "No title").strip()
+    summary = entry.get("article_summary") or canonical.get("canonical_summary") or headline
+    bullets = (canonical.get("key_facts") or {}).get("bullets") or [headline]
+    facts_line = " ".join(f"• {b}" for b in bullets[:3])
+    link = entry.get("link", "")
+
+    ts = datetime.now(PKT).strftime("%b %d, %Y %I:%M %p PKT")
     for key in ("published_parsed", "updated_parsed"):
         tp = entry.get(key)
         if tp:
             try:
                 dt = datetime(*tp[:6], tzinfo=timezone.utc)
-                ts = dt.astimezone(PKT).strftime("%b %d, %I:%M %p PKT")
+                ts = dt.astimezone(PKT).strftime("%b %d, %Y %I:%M %p PKT")
             except Exception:
                 pass
             break
+
     lines = [
-        f"{tag} [{source}] {title}",
+        headline,
         "",
-        f"📰 {scope.upper()} — {ts}" if ts else f"📰 {scope.upper()}",
+        f"Summary: {summary}",
+        "",
+        f"Key Facts: {facts_line}",
+        "",
+        f"Source: {source}",
+        "",
+        f"Published: {ts}",
+        "",
+        f"Story Type: {story_type}",
     ]
-    if entry.get("article_summary"):
-        lines.extend([f"📝 {entry['article_summary']}", ""])
-    lines.extend([
-        f"🔗 {link}",
-    ])
+    if link:
+        lines.extend(["", f"Link: {link}"])
     return "\n".join(lines)
 
 
 # ─── Collection + selection ───────────────────────────────────────────────────
 
 def _collect_feed(feed_cfg: dict, seen: dict, now, run_started: float) -> list[dict]:
-    """Fetch one feed, check it against already-sent articles, and return
-    its candidate stories.  Called per feed so each feed's deliveries are
-    independent — a later feed freezing can't lose earlier feeds' news."""
+    """Fetch one feed, extract full article content, run 72h canonical memory check,
+    and return candidate NEW STORY or SIGNIFICANT UPDATE items."""
     name, url, scope = feed_cfg["name"], feed_cfg["url"], feed_cfg["scope"]
     print(f"  ▸ Fetching {name} …", flush=True)
     try:
@@ -602,63 +1304,59 @@ def _collect_feed(feed_cfg: dict, seen: dict, now, run_started: float) -> list[d
         if time.time() - run_started > RUN_DEADLINE:
             print("  ⚠  Run deadline reached — stopping entry scan.", file=sys.stderr)
             break
-        tk = title_key(entry.get("title", ""))
-        if tk in seen:
-            continue
-        if seen_url_match(entry, seen):
-            print(f"    ↯ URL match (already sent): {entry.get('title','')[:50]}")
-            continue
-        title_tokens = set(_tokenize(_sim_text(entry)))
-        if seen_story_match(entry, seen):
-            print(f"    ↯ story match (already sent): {entry.get('title','')[:50]}")
-            continue
-        if fingerprint_matches(entry_text(entry), seen):
-            print(f"    ↯ fingerprint match (already sent): {entry.get('title','')[:50]}")
-            continue
-        if seen_semantic_match(title_tokens, seen, COSINE_THRESHOLD, MIN_SHARED_TOKENS):
-            print(f"    ↯ semantic match (already sent): {entry.get('title','')[:50]}")
-            continue
+
         if not is_recent(entry, now):
             continue
         if not is_important(entry, scope):
             continue
-        # RSS descriptions are often copied verbatim between outlets. Open a
-        # bounded number of links so body text can distinguish genuinely
-        # related reports whose headlines use different wording.
+
+        if seen_url_match(entry, seen):
+            print(f"    ↯ DUPLICATE (URL match): {name} | {entry.get('link', '')}")
+            continue
+
         candidate = dict(entry)
+        # Step 1: Fetch Full Content for candidate articles
         if enriched < MAX_ARTICLE_ENRICH:
             page_text, page_summary = _fetch_article_page(entry.get("link", ""))
             candidate["article_text"] = page_text
             candidate["article_summary"] = page_summary
             enriched += 1
-        if seen_story_match(candidate, seen):
-            print(f"    ↯ story match (article page, already sent): {entry.get('title','')[:50]}")
+
+        # Step 2, 4, 5 & 6: Evaluate against 72-hour Story Memory
+        classification, matched_key, sim_score = evaluate_entry_against_memory(
+            candidate, seen, name
+        )
+
+        if classification == "DUPLICATE":
+            print(
+                f"    ↯ DUPLICATE ({int(sim_score * 100)}% sim): "
+                f"source={name} url={entry.get('link', '')}"
+            )
             continue
+
+        tk = matched_key if (classification == "SIGNIFICANT UPDATE" and matched_key) else title_key(entry.get("title", ""))
+        canonical = build_canonical_story(candidate, name)
+        title_tokens = set(_tokenize(_sim_text(candidate)))
+
         raw.append({
-            "source":  name,
-            "scope":   scope,
-            "entry":   candidate,
-            "id":      tk,
-            "tokens":  title_tokens,
+            "source": name,
+            "scope": scope,
+            "entry": candidate,
+            "id": tk,
+            "tokens": title_tokens,
+            "story_type": classification,
+            "canonical": canonical,
         })
 
-    # Exact-title dedup within this feed (identical aggregator headlines)
     dedup: set[str] = set()
     unique = [a for a in raw if not (a["id"] in dedup or dedup.add(a["id"]))]
     return _semantic_dedup(unique, COSINE_THRESHOLD, MIN_SHARED_TOKENS)
 
 
-
-
-def _semantic_dedup(articles: list[dict],
-                    cos_threshold: float,
-                    min_shared: int) -> list[dict]:
-    """Drop near-duplicate stories reported with different wording.
-
-    Uses binary token cosine similarity on cleaned titles: two articles
-    are considered the same story when they share >= min_shared content
-    tokens AND cosine >= threshold.  The more authoritative source wins.
-    """
+def _semantic_dedup(
+    articles: list[dict], cos_threshold: float, min_shared: int
+) -> list[dict]:
+    """Drop near-duplicate stories within the same batch."""
     if len(articles) <= 1:
         return articles
 
@@ -678,7 +1376,7 @@ def _semantic_dedup(articles: list[dict],
                 dropped.add(j)
             else:
                 dropped.add(i)
-                break  # i was removed — stop scanning its remaining pairs
+                break
 
     kept = [a for idx, a in enumerate(articles) if idx not in dropped]
     removed = len(articles) - len(kept)
@@ -689,15 +1387,16 @@ def _semantic_dedup(articles: list[dict],
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
-def send_to_ntfy(message: str) -> bool:
+def send_to_ntfy(message: str, title: str = "Pakistan & World News") -> bool:
     url = f"{NTFY_SERVER}/{NTFY_TOPIC}"
+    safe_title = title.encode("ascii", "ignore").decode("ascii").strip() or "Pakistan & World News"
     try:
         r = requests.post(
             url,
             data=message.encode("utf-8"),
             headers={
-                "Title":    "Pakistan & World News",
-                "Tags":     "newspaper,news,pakistan",
+                "Title": safe_title[:120],
+                "Tags": "newspaper,news,pakistan",
                 "Priority": "default",
             },
             timeout=15,
@@ -710,7 +1409,10 @@ def send_to_ntfy(message: str) -> bool:
 
 def main() -> None:
     now_pk = datetime.now(PKT).strftime("%b %d, %I:%M %p PKT")
-    print(f"═══ News fetcher  |  {now_pk}  |  topic={NTFY_TOPIC}  |  window={WINDOW_MINUTES}min  |  cap={MAX_PER_RUN} ═══\n")
+    print(
+        f"═══ News fetcher  |  {now_pk}  |  topic={NTFY_TOPIC}  "
+        f"|  retention={SEEN_SCAN_HOURS}h  |  cap={MAX_PER_RUN} ═══\n"
+    )
 
     now = datetime.now(timezone.utc)
     seen = load_seen()
@@ -729,12 +1431,17 @@ def main() -> None:
         if not cands:
             continue
 
-        # Drop duplicate links and paraphrased stories already sent earlier
-        # in this run (feed ordering gives earlier sources priority).
         kept = []
         for c in cands:
-            dup = any(_same_article_entries(c["entry"], prior["entry"])
-                      for prior in sent)
+            dup = False
+            for prior in sent:
+                if _same_article_entries(c["entry"], prior["entry"]):
+                    if is_significant_update(c["entry"], build_memory_record(prior["entry"], prior["source"], prior["id"], prior.get("story_type", "NEW STORY"), prior.get("canonical"))):
+                        c["story_type"] = "SIGNIFICANT UPDATE"
+                        c["id"] = prior["id"]
+                    else:
+                        dup = True
+                        break
             if not dup:
                 kept.append(c)
         if len(kept) < len(cands):
@@ -745,30 +1452,32 @@ def main() -> None:
                 break
             if source_used[art["source"]] >= 5:
                 continue
-            body = format_message(art["entry"], art["source"], art["scope"])
-            ok = send_to_ntfy(body)
+            story_type = art.get("story_type", "NEW STORY")
+            canonical = art.get("canonical") or build_canonical_story(art["entry"], art["source"])
+            body = format_message(
+                art["entry"],
+                art["source"],
+                art["scope"],
+                story_type=story_type,
+                canonical=canonical,
+            )
+            ok = send_to_ntfy(body, title=canonical.get("headline", "Pakistan & World News"))
             if ok:
                 sent.append(art)
                 source_used[art["source"]] += 1
-                urls = sorted(_entry_urls(art["entry"]))
-                title_tokens = sorted(set(_tokenize(_sim_text(art["entry"]))))
-                # Keep the cache compact even when an article page contains a
-                # long body; title/summary/page fingerprints are still broad
-                # enough for the next 12-hour deduplication window.
-                story_tokens = sorted(_story_tokens(art["entry"]))[:120]
-                seen[art["id"]] = {
-                    "ts": int(time.time()),
-                    "kw": ",".join(extract_keywords(entry_text(art["entry"]))),
-                    "tt": ",".join(title_tokens),
-                    "st": ",".join(story_tokens),
-                    "urls": urls,
-                    "url": urls[0] if urls else "",
-                }
-                # Persist after every send so a run killed mid-way (e.g. by the
-                # outer watchdog) never re-sends what was already delivered.
+                seen[art["id"]] = build_memory_record(
+                    art["entry"],
+                    art["source"],
+                    art["id"],
+                    story_type=story_type,
+                    canonical=canonical,
+                )
                 save_seen(seen)
             else:
-                print(f"  ⚠  Failed to send: {art['entry'].get('title','?')[:60]}", file=sys.stderr)
+                print(
+                    f"  ⚠  Failed to send: {art['entry'].get('title', '?')[:60]}",
+                    file=sys.stderr,
+                )
 
     if not sent:
         print("Nothing new — done.")

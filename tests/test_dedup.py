@@ -1,7 +1,8 @@
 import os
-import sys
-import unittest
 from pathlib import Path
+import sys
+import time
+import unittest
 
 os.environ.setdefault("NTFY_TOPIC", "dedup-test-topic")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -16,8 +17,6 @@ class DuplicateDetectionTests(unittest.TestCase):
             "summary": "The Bollywood actor from India discussed upcoming film projects.",
         }
         self.assertFalse(news.is_important(entry, "international"))
-        # Apply the identity guard to national feeds too, not just the broad
-        # international Imran Khan search.
         self.assertFalse(news.is_important(entry, "national"))
 
     def test_pakistani_politician_and_cricketer_imran_khan_is_kept(self):
@@ -47,7 +46,8 @@ class DuplicateDetectionTests(unittest.TestCase):
 
     def test_url_normalization_removes_tracking_and_fragments(self):
         first = news._canonical_url(
-            "http://www.example.com/story/123/?utm_source=rss#comments")
+            "http://www.example.com/story/123/?utm_source=rss#comments"
+        )
         second = news._canonical_url("https://example.com/story/123")
         self.assertEqual(first, second)
 
@@ -65,8 +65,14 @@ class DuplicateDetectionTests(unittest.TestCase):
         self.assertTrue(news._same_article_entries(first, second))
 
     def test_same_canonical_link_is_duplicate_even_if_headline_changes(self):
-        first = {"title": "Court announces new hearing date", "link": "https://example.com/story?utm_source=rss"}
-        second = {"title": "Judges set date for next hearing", "link": "https://example.com/story#top"}
+        first = {
+            "title": "Court announces new hearing date",
+            "link": "https://example.com/story?utm_source=rss",
+        }
+        second = {
+            "title": "Judges set date for next hearing",
+            "link": "https://example.com/story#top",
+        }
         self.assertTrue(news._same_article_entries(first, second))
 
     def test_unrelated_stories_about_same_person_are_not_duplicates(self):
@@ -143,6 +149,67 @@ class DuplicateDetectionTests(unittest.TestCase):
         self.assertFalse(news.seen_url_match(entry, seen))
         seen["old-id"]["urls"].append("https://another.example/report")
         self.assertTrue(news.seen_url_match(entry, seen))
+
+    def test_72_hour_rolling_story_memory_retention(self):
+        self.assertEqual(news.SEEN_SCAN_HOURS, 72)
+        now = time.time()
+        seen = {
+            "within-48h": {"ts": int(now - 48 * 3600), "tt": "imran,khan"},
+            "older-than-72h": {"ts": int(now - 75 * 3600), "tt": "old,story"},
+        }
+        pruned = news._prune_seen(seen)
+        self.assertIn("within-48h", pruned)
+        self.assertNotIn("older-than-72h", pruned)
+
+    def test_story_evolution_detects_significant_update_vs_duplicate(self):
+        initial_entry = {
+            "title": "Microsoft announces layoffs across global divisions",
+            "summary": "Microsoft announced plans for workforce layoffs as part of a review.",
+            "link": "https://reuters.example/msft-layoffs",
+        }
+        stored_record = news.build_memory_record(
+            initial_entry, "Reuters", "story-msft-1", "NEW STORY"
+        )
+        seen = {"story-msft-1": stored_record}
+
+        # Duplicate report from another source with no new figures
+        bloomberg_dup = {
+            "title": "Microsoft plans job cuts across global divisions",
+            "summary": "Microsoft announced plans for workforce layoffs as part of a review.",
+            "link": "https://bloomberg.example/msft-cuts",
+        }
+        classification_dup, _, _ = news.evaluate_entry_against_memory(
+            bloomberg_dup, seen, "Bloomberg"
+        )
+        self.assertEqual(classification_dup, "DUPLICATE")
+
+        # Significant update with confirmed 9,000 figure and restructuring details
+        update_entry = {
+            "title": "Microsoft confirms 9,000 layoffs and publishes restructuring details",
+            "summary": (
+                "Microsoft officially confirmed 9,000 layoffs across global divisions "
+                "and published full restructuring details and severance packages."
+            ),
+            "link": "https://reuters.example/msft-9000-confirmed",
+        }
+        classification_upd, matched_key, _ = news.evaluate_entry_against_memory(
+            update_entry, seen, "Reuters"
+        )
+        self.assertEqual(classification_upd, "SIGNIFICANT UPDATE")
+        self.assertEqual(matched_key, "story-msft-1")
+
+    def test_step_7_delivery_format_contains_required_fields(self):
+        entry = {
+            "title": "Islamabad High Court hears Imran Khan bail petition",
+            "summary": "The Islamabad High Court heard arguments in the bail petition in Islamabad.",
+            "link": "https://www.dawn.com/news/123456",
+        }
+        msg = news.format_message(entry, "Dawn", "national", story_type="NEW STORY")
+        self.assertIn("Summary:", msg)
+        self.assertIn("Key Facts: •", msg)
+        self.assertIn("Source: Dawn", msg)
+        self.assertIn("Published:", msg)
+        self.assertIn("Story Type: NEW STORY", msg)
 
 
 if __name__ == "__main__":
