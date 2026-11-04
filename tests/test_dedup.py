@@ -198,7 +198,24 @@ class DuplicateDetectionTests(unittest.TestCase):
         self.assertEqual(classification_upd, "SIGNIFICANT UPDATE")
         self.assertEqual(matched_key, "story-msft-1")
 
-    def test_step_7_delivery_format_contains_required_fields(self):
+    def test_legacy_cache_entries_never_retrigger_as_significant_updates(self):
+        legacy_seen = {
+            "legacy-1": {
+                "ts": int(time.time()),
+                "tt": "govt,price,fuel,per,litre,high,speed",
+                "st": "govt,price,fuel,per,litre,high,speed,wednesday",
+                "urls": ["https://www.dawn.com/news/2041886"],
+            }
+        }
+        incoming = {
+            "title": "Govt cuts petrol price by Rs5.45 per litre, high-speed diesel by Rs3.68",
+            "summary": "Petrol will retail at Rs369.06 per litre on Wednesday.",
+            "link": "https://another.example/petrol-cut",
+        }
+        classification, _, _ = news.evaluate_entry_against_memory(incoming, legacy_seen, "Dawn")
+        self.assertEqual(classification, "DUPLICATE")
+
+    def test_step_7_delivery_format_contains_required_fields_and_link(self):
         entry = {
             "title": "Islamabad High Court hears Imran Khan bail petition",
             "summary": "The Islamabad High Court heard arguments in the bail petition in Islamabad.",
@@ -210,6 +227,8 @@ class DuplicateDetectionTests(unittest.TestCase):
         self.assertIn("Source: Dawn", msg)
         self.assertIn("Published:", msg)
         self.assertIn("Story Type: NEW STORY", msg)
+        self.assertIn("Link: https://www.dawn.com/news/123456", msg)
+        self.assertFalse(news.send_to_ntfy(msg, title="Test", link=""))
 
 
 if __name__ == "__main__":

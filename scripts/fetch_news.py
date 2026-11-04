@@ -3,7 +3,8 @@
 Fetch half-hourly news from Pakistani English-language & international RSS feeds,
 extract full editorial content, build a Canonical Story Summary + Event Fingerprint,
 maintain a 72-hour Rolling Story Memory Database, detect duplicates & story updates,
-and deliver only NEW STORY or SIGNIFICANT UPDATE alerts to ntfy.sh.
+and deliver only NEW STORY or SIGNIFICANT UPDATE alerts (always with clickable links)
+to ntfy.sh.
 
 Usage:
     NTFY_TOPIC=NewsPakistan_xxxxx  python3 scripts/fetch_news.py
@@ -177,7 +178,6 @@ STOP_WORDS = {
     "file", "photo", "image", "latest", "live", "update", "read",
 }
 
-# Canonical synonym mapping so different wordings of the same concept map to identical tokens
 CANONICAL_SYNONYMS = {
     "plea": "appeal",
     "petition": "appeal",
@@ -241,7 +241,6 @@ CANONICAL_SYNONYMS = {
     "gasoline": "fuel",
     "diesel": "fuel",
     "layoffs": "layoff",
-    "cuts": "layoff",
     "job": "layoff",
     "jobs": "layoff",
     "acquisition": "acquire",
@@ -261,6 +260,11 @@ CANONICAL_SYNONYMS = {
 }
 
 _GNEWS_SUFFIX_RE = re.compile(r"\s+-\s*[^-|]+$")
+_SITE_BANNER_RE = re.compile(
+    r"(?:\s*-\s*(?:World|Pakistan|Business|Sport|Opinion|Editorial|Tech)\s*-\s*DAWN\.COM|"
+    r"Get the latest news and updates from Dawn\s*)",
+    re.IGNORECASE,
+)
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
@@ -275,6 +279,7 @@ def _strip_html(raw: str) -> str:
         .replace("&#39;", "'")
         .replace("&apos;", "'")
     )
+    cleaned = _SITE_BANNER_RE.sub(" ", cleaned)
     return " ".join(cleaned.split())
 
 
@@ -375,6 +380,7 @@ class _ArticlePageParser(HTMLParser):
         "sponsored content",
         "cookie policy",
         "privacy policy",
+        "get the latest news and updates from dawn",
     )
 
     def __init__(self):
@@ -396,8 +402,9 @@ class _ArticlePageParser(HTMLParser):
         elif tag == "meta" and not self._skip:
             key = (attrs_dict.get("name") or attrs_dict.get("property") or "").lower()
             if key in {"description", "og:description", "twitter:description"}:
-                if attrs_dict.get("content"):
-                    self._meta.append(attrs_dict["content"])
+                content = (attrs_dict.get("content") or "").strip()
+                if content and not any(m in content.lower() for m in self._BOILERPLATE_MARKERS):
+                    self._meta.append(content)
         elif tag == "p" and not self._skip:
             self._current = []
 
@@ -423,8 +430,13 @@ class _ArticlePageParser(HTMLParser):
             self._current.append(data)
 
     def text(self) -> str:
-        parts = [" ".join("".join(self._title).split()), *self._meta]
+        clean_title = _SITE_BANNER_RE.sub("", " ".join("".join(self._title).split())).strip()
+        parts = []
+        if clean_title:
+            parts.append(clean_title)
         parts.extend(self._paragraphs[:100])
+        if not self._paragraphs and self._meta:
+            parts.extend(self._meta)
         return " ".join(p.strip() for p in parts if p.strip())[:ARTICLE_TEXT_LIMIT]
 
 
@@ -439,11 +451,15 @@ def _extractive_summary(text: str, limit: int = 280) -> str:
     """Return a short page-derived summary without requiring an LLM/API key."""
     if _is_google_news_boilerplate(text):
         return ""
-    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    cleaned_text = _SITE_BANNER_RE.sub(" ", text).strip()
+    sentences = re.split(r"(?<=[.!?])\s+", cleaned_text)
     chosen = []
+    seen_norm = set()
     for sentence in sentences:
         sentence = " ".join(sentence.split())
-        if len(sentence) >= 40:
+        norm = re.sub(r"\W+", "", sentence.lower())[:50]
+        if len(sentence) >= 40 and norm not in seen_norm:
+            seen_norm.add(norm)
             chosen.append(sentence)
         if len(" ".join(chosen)) >= limit:
             break
@@ -459,16 +475,20 @@ def _canonical_summary_100_150_words(title: str, rss_summary: str, article_text:
     if _is_google_news_boilerplate(clean_body):
         clean_body = ""
 
-    # Combine unique informative sentences
-    raw_source = f"{clean_body} {clean_rss}".strip() or clean_title
-    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", raw_source) if len(s.strip()) >= 25]
+    # Remove title repetition from the start of body
+    if clean_body.lower().startswith(clean_title.lower()):
+        clean_body = clean_body[len(clean_title):].lstrip(" .,-—:")
 
-    seen_sent = set()
+    raw_source = f"{clean_body} {clean_rss}".strip() or clean_title
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", raw_source) if len(s.strip()) >= 30]
+
+    title_norm = re.sub(r"\W+", "", clean_title.lower())[:45]
+    seen_sent = {title_norm} if title_norm else set()
     selected = []
     word_count = 0
 
     for sent in sentences:
-        norm = re.sub(r"\W+", "", sent.lower())[:60]
+        norm = re.sub(r"\W+", "", sent.lower())[:50]
         if norm in seen_sent:
             continue
         seen_sent.add(norm)
@@ -685,7 +705,6 @@ def extract_story_entities(text: str) -> dict[str, list[str]]:
         if re.search(r"\b" + re.escape(pat) + r"\b", lower):
             events.add(canon)
 
-    # Also capture capitalized 2-word proper nouns from the text for unseen entities
     for match in re.findall(r"\b([A-Z][a-z]{2,}\s+[A-Z][a-z]{2,})\b", clean):
         m_low = match.lower()
         if (
@@ -713,6 +732,9 @@ def extract_key_facts(title: str, summary: str, article_text: str, entities: dic
     clean_body = _strip_html(article_text or summary or "").strip()
     if _is_google_news_boilerplate(clean_body):
         clean_body = _GNEWS_SUFFIX_RE.sub("", _strip_html(summary or "")).strip()
+
+    if clean_body.lower().startswith(clean_title.lower()):
+        clean_body = clean_body[len(clean_title):].lstrip(" .,-—:")
 
     sentences = [
         " ".join(s.split())
@@ -760,12 +782,9 @@ def generate_event_fingerprint(title: str, summary: str, article_text: str, enti
     tokens = _tokenize(combined)
     freq = Counter(tokens)
 
-    # Boost core entity & event tokens so different headlines about the same event converge
-    entity_tokens = set()
     for group in entities.values():
         for item in group:
             for t in _tokenize(item):
-                entity_tokens.add(t)
                 freq[t] += 3
 
     top_terms = [w for w, _ in freq.most_common(10)]
@@ -849,43 +868,49 @@ def _extract_numbers(text: str) -> set[str]:
 
 
 UPDATE_SIGNAL_WORDS = {
-    "confirms", "confirmed", "confirmation", "details", "restructuring",
-    "verdict", "sentenced", "approved", "rejected", "casualties", " toll",
-    "official", "published", "announces", "announced",
+    "confirms", "confirmed", "confirmation", "restructuring",
+    "verdict", "sentenced", "casualties", "toll",
 }
 
 
 def is_significant_update(new_entry: dict, stored_record: dict) -> bool:
-    """Step 6: Determine if an article about the same event contains substantially
-    new facts, figures, outcomes, or confirmations compared to the stored story."""
-    new_text = (
-        f"{new_entry.get('title', '')} {new_entry.get('summary', '')} "
-        f"{new_entry.get('article_text', '')}"
-    )
-    old_text = (
-        f"{stored_record.get('original_headline', '')} "
-        f"{stored_record.get('canonical_summary', '')} "
-        f"{stored_record.get('st', '')}"
-    )
-    if not old_text.strip():
+    """Step 6: Determine if a newer article about an already-stored event contains
+    substantially new confirmed figures, outcomes, or developments.
+    Never triggers on legacy cache records or identical URLs/headlines."""
+    if not isinstance(stored_record, dict):
         return False
 
-    new_nums = _extract_numbers(new_text)
-    old_nums = _extract_numbers(old_text)
-    added_nums = new_nums - old_nums
+    old_headline = (stored_record.get("original_headline") or "").strip()
+    old_summary = (stored_record.get("canonical_summary") or "").strip()
+    # If the stored record is a legacy entry without original_headline, never re-send as update
+    if not old_headline:
+        return False
 
-    new_tokens = set(_tokenize(new_text))
-    old_tokens = set(stored_record.get("st", "").split(",")) - {""}
-    if not old_tokens:
-        old_tokens = set(_tokenize(old_text))
+    new_headline = (new_entry.get("title") or "").strip()
+    if title_key(new_headline) == title_key(old_headline):
+        return False
 
-    novel_tokens = new_tokens - old_tokens
-    has_update_signal = bool(novel_tokens & UPDATE_SIGNAL_WORDS)
+    # Same URL is never a new update
+    new_urls = _entry_urls(new_entry)
+    old_urls = set(stored_record.get("urls", []))
+    if new_urls and old_urls and (new_urls & old_urls):
+        return False
 
-    # Example: "Microsoft announces layoffs" -> "Microsoft confirms 9,000 layoffs and publishes restructuring details"
-    if added_nums and (has_update_signal or len(novel_tokens) >= 3):
-        return True
-    if has_update_signal and len(novel_tokens) >= 6 and len(new_tokens) >= len(old_tokens) + 4:
+    new_text = f"{new_headline} {new_entry.get('summary', '')} {new_entry.get('article_text', '')}"
+    old_text = f"{old_headline} {old_summary}"
+
+    new_headline_nums = _extract_numbers(new_headline)
+    old_all_nums = _extract_numbers(old_text)
+    added_headline_nums = new_headline_nums - old_all_nums
+
+    new_words = set(re.findall(r"\b[a-z]{3,}\b", new_text.lower()))
+    old_words = set(re.findall(r"\b[a-z]{3,}\b", old_text.lower()))
+    novel_words = new_words - old_words
+
+    has_explicit_update_signal = bool(novel_words & UPDATE_SIGNAL_WORDS)
+
+    # Require both a new confirmed figure in the headline AND an explicit update/confirmation signal
+    if added_headline_nums and has_explicit_update_signal and len(novel_words) >= 3:
         return True
     return False
 
@@ -917,7 +942,6 @@ def compute_story_similarity(left_entry: dict, right_entry_or_record: dict) -> f
     left_title = set(_tokenize(_sim_text(left_entry)))
     left_story = _story_tokens(left_entry)
 
-    # Support comparing against either another live entry dict or a stored seen_articles record
     if "tt" in right_entry_or_record or "canonical_summary" in right_entry_or_record:
         right_title = set(right_entry_or_record.get("tt", "").split(",")) - {""}
         if not right_title and right_entry_or_record.get("original_headline"):
@@ -956,7 +980,6 @@ def _same_article_entries(left: dict, right: dict) -> bool:
     if _semantic_match(left_title, left_story, right_title, right_story):
         return True
 
-    # Also check Event Fingerprint & entity/fact overlap (Step 4 & Step 5)
     left_canon = build_canonical_story(left)
     right_canon = build_canonical_story(right)
     fp_left = set(_tokenize(left_canon["event_fingerprint"]))
@@ -1105,7 +1128,6 @@ def seen_story_match(entry: dict, seen: dict) -> bool:
         if _semantic_match(title_tokens, story_tokens, seen_title, seen_story):
             return True
 
-        # Check Event Fingerprint & Semantic Embedding if stored in the memory record
         if val.get("event_fingerprint") or val.get("embedding"):
             if candidate_canon is None:
                 candidate_canon = build_canonical_story(entry)
@@ -1125,8 +1147,9 @@ def evaluate_entry_against_memory(entry: dict, seen: dict, source: str = "") -> 
     Returns (classification, matched_key, similarity_score) where classification is:
     'NEW STORY', 'SIGNIFICANT UPDATE', or 'DUPLICATE'.
     """
-    if seen_url_match(entry, seen):
-        return "DUPLICATE", None, 1.0
+    tk = title_key(entry.get("title", ""))
+    if tk in seen or seen_url_match(entry, seen):
+        return "DUPLICATE", tk if tk in seen else None, 1.0
 
     best_key = None
     best_record = None
@@ -1144,7 +1167,6 @@ def evaluate_entry_against_memory(entry: dict, seen: dict, source: str = "") -> 
     if best_record is None:
         return "NEW STORY", None, 0.0
 
-    # Step 5 & Step 6: Check if >= 85% or 70-84% with matching event facts
     if best_sim >= DUPLICATE_HIGH_THRESHOLD or seen_story_match(entry, {best_key: best_record}):
         if is_significant_update(entry, best_record):
             return "SIGNIFICANT UPDATE", best_key, best_sim
@@ -1239,7 +1261,8 @@ def format_message(
     canonical: dict | None = None,
 ) -> str:
     """Step 7: Format notification strictly as NEW STORY or SIGNIFICANT UPDATE with
-    Headline, 100-150w Summary, Key Facts bullets, Source, Published timestamp, and Story Type."""
+    Headline, 100-150w Summary, Key Facts bullets, Source, Published timestamp,
+    Story Type, and direct clickable Link."""
     if canonical is None:
         canonical = build_canonical_story(entry, source)
 
@@ -1247,7 +1270,7 @@ def format_message(
     summary = entry.get("article_summary") or canonical.get("canonical_summary") or headline
     bullets = (canonical.get("key_facts") or {}).get("bullets") or [headline]
     facts_line = " ".join(f"• {b}" for b in bullets[:3])
-    link = entry.get("link", "")
+    link = (entry.get("link") or "").strip()
 
     ts = datetime.now(PKT).strftime("%b %d, %Y %I:%M %p PKT")
     for key in ("published_parsed", "updated_parsed"):
@@ -1272,17 +1295,17 @@ def format_message(
         f"Published: {ts}",
         "",
         f"Story Type: {story_type}",
+        "",
+        f"Link: {link}",
     ]
-    if link:
-        lines.extend(["", f"Link: {link}"])
     return "\n".join(lines)
 
 
 # ─── Collection + selection ───────────────────────────────────────────────────
 
 def _collect_feed(feed_cfg: dict, seen: dict, now, run_started: float) -> list[dict]:
-    """Fetch one feed, extract full article content, run 72h canonical memory check,
-    and return candidate NEW STORY or SIGNIFICANT UPDATE items."""
+    """Fetch one feed, require a valid article URL, extract full article content,
+    run 72h canonical memory check, and return candidate items."""
     name, url, scope = feed_cfg["name"], feed_cfg["url"], feed_cfg["scope"]
     print(f"  ▸ Fetching {name} …", flush=True)
     try:
@@ -1305,19 +1328,27 @@ def _collect_feed(feed_cfg: dict, seen: dict, now, run_started: float) -> list[d
             print("  ⚠  Run deadline reached — stopping entry scan.", file=sys.stderr)
             break
 
+        # Strictly require a valid http/https link so stories without links are never sent
+        link = (entry.get("link") or "").strip()
+        if not link or not link.startswith(("http://", "https://")):
+            continue
+
         if not is_recent(entry, now):
             continue
         if not is_important(entry, scope):
             continue
 
+        tk = title_key(entry.get("title", ""))
+        if tk in seen:
+            continue
         if seen_url_match(entry, seen):
-            print(f"    ↯ DUPLICATE (URL match): {name} | {entry.get('link', '')}")
+            print(f"    ↯ DUPLICATE (URL match): {name} | {link}")
             continue
 
         candidate = dict(entry)
         # Step 1: Fetch Full Content for candidate articles
         if enriched < MAX_ARTICLE_ENRICH:
-            page_text, page_summary = _fetch_article_page(entry.get("link", ""))
+            page_text, page_summary = _fetch_article_page(link)
             candidate["article_text"] = page_text
             candidate["article_summary"] = page_summary
             enriched += 1
@@ -1330,11 +1361,11 @@ def _collect_feed(feed_cfg: dict, seen: dict, now, run_started: float) -> list[d
         if classification == "DUPLICATE":
             print(
                 f"    ↯ DUPLICATE ({int(sim_score * 100)}% sim): "
-                f"source={name} url={entry.get('link', '')}"
+                f"source={name} url={link}"
             )
             continue
 
-        tk = matched_key if (classification == "SIGNIFICANT UPDATE" and matched_key) else title_key(entry.get("title", ""))
+        final_id = matched_key if (classification == "SIGNIFICANT UPDATE" and matched_key) else tk
         canonical = build_canonical_story(candidate, name)
         title_tokens = set(_tokenize(_sim_text(candidate)))
 
@@ -1342,7 +1373,7 @@ def _collect_feed(feed_cfg: dict, seen: dict, now, run_started: float) -> list[d
             "source": name,
             "scope": scope,
             "entry": candidate,
-            "id": tk,
+            "id": final_id,
             "tokens": title_tokens,
             "story_type": classification,
             "canonical": canonical,
@@ -1387,18 +1418,22 @@ def _semantic_dedup(
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
-def send_to_ntfy(message: str, title: str = "Pakistan & World News") -> bool:
+def send_to_ntfy(message: str, title: str = "Pakistan & World News", link: str = "") -> bool:
+    if not link or not link.startswith(("http://", "https://")):
+        return False
     url = f"{NTFY_SERVER}/{NTFY_TOPIC}"
     safe_title = title.encode("ascii", "ignore").decode("ascii").strip() or "Pakistan & World News"
+    headers = {
+        "Title": safe_title[:120],
+        "Click": link,
+        "Tags": "newspaper,news,pakistan",
+        "Priority": "default",
+    }
     try:
         r = requests.post(
             url,
             data=message.encode("utf-8"),
-            headers={
-                "Title": safe_title[:120],
-                "Tags": "newspaper,news,pakistan",
-                "Priority": "default",
-            },
+            headers=headers,
             timeout=15,
         )
         return r.status_code in (200, 201)
@@ -1436,12 +1471,8 @@ def main() -> None:
             dup = False
             for prior in sent:
                 if _same_article_entries(c["entry"], prior["entry"]):
-                    if is_significant_update(c["entry"], build_memory_record(prior["entry"], prior["source"], prior["id"], prior.get("story_type", "NEW STORY"), prior.get("canonical"))):
-                        c["story_type"] = "SIGNIFICANT UPDATE"
-                        c["id"] = prior["id"]
-                    else:
-                        dup = True
-                        break
+                    dup = True
+                    break
             if not dup:
                 kept.append(c)
         if len(kept) < len(cands):
@@ -1452,6 +1483,9 @@ def main() -> None:
                 break
             if source_used[art["source"]] >= 5:
                 continue
+            link = (art["entry"].get("link") or "").strip()
+            if not link or not link.startswith(("http://", "https://")):
+                continue
             story_type = art.get("story_type", "NEW STORY")
             canonical = art.get("canonical") or build_canonical_story(art["entry"], art["source"])
             body = format_message(
@@ -1461,7 +1495,11 @@ def main() -> None:
                 story_type=story_type,
                 canonical=canonical,
             )
-            ok = send_to_ntfy(body, title=canonical.get("headline", "Pakistan & World News"))
+            ok = send_to_ntfy(
+                body,
+                title=canonical.get("headline", "Pakistan & World News"),
+                link=link,
+            )
             if ok:
                 sent.append(art)
                 source_used[art["source"]] += 1
