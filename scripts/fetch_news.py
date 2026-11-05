@@ -176,14 +176,24 @@ STOP_WORDS = {
     "told", "reuters", "us", "pakistani", "pakistan", "cent", "pc",
     "week", "today", "year", "month", "day", "getty", "afp", "ap",
     "file", "photo", "image", "latest", "live", "update", "read",
+    "related", "against", "following", "ahead", "amid", "why", "how",
+    "what", "where", "when", "who", "whom", "which", "while", "during",
+    "through", "across", "around", "within", "without", "upon", "towards",
+    "toward", "regarding", "concerning", "despite", "whether", "watch",
+    "info",
 }
 
 CANONICAL_SYNONYMS = {
     "plea": "appeal",
+    "pleas": "appeal",
     "petition": "appeal",
     "petitions": "appeal",
-    "pleas": "appeal",
+    "petitioner": "appeal",
     "appeals": "appeal",
+    "case": "appeal",
+    "cases": "appeal",
+    "suit": "appeal",
+    "suits": "appeal",
     "skipper": "captain",
     "skippers": "captain",
     "captains": "captain",
@@ -197,6 +207,12 @@ CANONICAL_SYNONYMS = {
     "custody": "detention",
     "prison": "detention",
     "jail": "detention",
+    "detained": "detention",
+    "detain": "detention",
+    "detains": "detention",
+    "arrest": "detention",
+    "arrests": "detention",
+    "arrested": "detention",
     "compassion": "humanitarian",
     "mercy": "humanitarian",
     "treatment": "humanitarian",
@@ -216,6 +232,50 @@ CANONICAL_SYNONYMS = {
     "turns": "reject",
     "quashes": "reject",
     "quashed": "reject",
+    "bars": "bar",
+    "barred": "bar",
+    "barring": "bar",
+    "restrains": "bar",
+    "restrained": "bar",
+    "restrain": "bar",
+    "halts": "bar",
+    "halted": "bar",
+    "halt": "bar",
+    "halting": "bar",
+    "postpone": "bar",
+    "postpones": "bar",
+    "postponed": "bar",
+    "postponing": "bar",
+    "delays": "bar",
+    "delayed": "bar",
+    "delay": "bar",
+    "suspends": "bar",
+    "suspended": "bar",
+    "suspend": "bar",
+    "stays": "bar",
+    "stayed": "bar",
+    "blocks": "bar",
+    "blocked": "bar",
+    "stops": "bar",
+    "stopped": "bar",
+    "hearing": "hear",
+    "hearings": "hear",
+    "hears": "hear",
+    "heard": "hear",
+    "polls": "election",
+    "poll": "election",
+    "polling": "election",
+    "elections": "election",
+    "vote": "election",
+    "voting": "election",
+    "ballot": "election",
+    "fixes": "schedule",
+    "fixed": "schedule",
+    "sets": "schedule",
+    "schedules": "schedule",
+    "scheduled": "schedule",
+    "announces": "schedule",
+    "announced": "schedule",
     "approves": "approve",
     "approved": "approve",
     "clears": "approve",
@@ -257,9 +317,49 @@ CANONICAL_SYNONYMS = {
     "blast": "explosion",
     "blasts": "explosion",
     "bombing": "explosion",
+    "january": "jan",
+    "february": "feb",
+    "march": "mar",
+    "april": "apr",
+    "june": "jun",
+    "july": "jul",
+    "august": "aug",
+    "september": "sep",
+    "sept": "sep",
+    "october": "oct",
+    "november": "nov",
+    "novembar": "nov",
+    "december": "dec",
+    "clash": "match",
+    "broadcast": "match",
+    "streaming": "match",
 }
 
+PHRASE_NORMALIZATIONS = [
+    (re.compile(r"\bfederal\s+constitutional\s+court\b", re.I), "fcc"),
+    (re.compile(r"\bconstitutional\s+court\b", re.I), "fcc"),
+    (re.compile(r"\bconstitution\s+court\b", re.I), "fcc"),
+    (re.compile(r"\bpeshawar\s+high\s+court\b", re.I), "phc"),
+    (re.compile(r"\bislamabad\s+high\s+court\b", re.I), "ihc"),
+    (re.compile(r"\blahore\s+high\s+court\b", re.I), "lhc"),
+    (re.compile(r"\bsindh\s+high\s+court\b", re.I), "shc"),
+    (re.compile(r"\bbalochistan\s+high\s+court\b", re.I), "bhc"),
+    (re.compile(r"\bsupreme\s+court(?:\s+of\s+pakistan)?\b", re.I), "sc"),
+    (re.compile(r"\belection\s+commission(?:\s+of\s+pakistan)?\b", re.I), "ecp"),
+    (re.compile(r"\bmaintenance\s+of\s+public\s+order(?:\s+ordinance)?\b", re.I), "mpo"),
+    (re.compile(r"\b3[-\s]?mpo\b", re.I), "mpo"),
+    (re.compile(r"\bpakistan\s+tehreek[-\s]e[-\s]insaf\b", re.I), "pti"),
+    (re.compile(r"\btehreek[-\s]e[-\s]insaf\b", re.I), "pti"),
+    (re.compile(r"\bkhyber\s+pakhtunkhwa\b", re.I), "kp"),
+    (re.compile(r"\bkpk\b", re.I), "kp"),
+    (re.compile(r"\blocal\s+(?:government|govt)\b", re.I), "localgov"),
+    (re.compile(r"\blocal\s+(?:elections?|polls?)\b", re.I), "localgov election"),
+    (re.compile(r"\b(?:india\s+(?:vs?\.?\s+)?pakistan|pakistan\s+(?:vs?\.?\s+)?india|ind\s+vs?\.?\s+pak|pak\s+vs?\.?\s+ind)\b", re.I), "indiapakistan match"),
+    (re.compile(r"\bhead[-\s]to[-\s]head\b", re.I), "match"),
+]
+
 _GNEWS_SUFFIX_RE = re.compile(r"\s+-\s*[^-|]+$")
+_GNEWS_FONT_RE = re.compile(r"<font\b[^>]*>.*?</font>", re.IGNORECASE | re.DOTALL)
 _SITE_BANNER_RE = re.compile(
     r"(?:\s*-\s*(?:World|Pakistan|Business|Sport|Opinion|Editorial|Tech)\s*-\s*DAWN\.COM|"
     r"Get the latest news and updates from Dawn\s*)",
@@ -271,7 +371,8 @@ _HTML_TAG_RE = re.compile(r"<[^>]+>")
 def _strip_html(raw: str) -> str:
     if not raw:
         return ""
-    cleaned = _HTML_TAG_RE.sub(" ", raw)
+    cleaned = _GNEWS_FONT_RE.sub(" ", raw)
+    cleaned = _HTML_TAG_RE.sub(" ", cleaned)
     cleaned = (
         cleaned.replace("&nbsp;", " ")
         .replace("&amp;", "&")
@@ -283,16 +384,29 @@ def _strip_html(raw: str) -> str:
     return " ".join(cleaned.split())
 
 
+def _normalize_phrases(text: str) -> str:
+    normalized = text
+    for pattern, replacement in PHRASE_NORMALIZATIONS:
+        normalized = pattern.sub(replacement, normalized)
+    return normalized
+
+
 def _tokenize(text: str) -> list[str]:
-    cleaned = _strip_html(text)
+    cleaned = _normalize_phrases(_strip_html(text))
     words = re.findall(r"\b[a-z]{2,}\b", cleaned.lower())
     tokens = []
     for word in words:
         if word in CANONICAL_SYNONYMS:
             word = CANONICAL_SYNONYMS[word]
-        elif len(word) > 5 and word.endswith("ies"):
+        elif len(word) > 4 and word.endswith("ies"):
             word = word[:-3] + "y"
-        elif len(word) > 5 and word.endswith("s") and not word.endswith("ss"):
+        elif len(word) > 4 and word.endswith("es") and not word.endswith(("ses", "xes", "zes", "ches", "shes")):
+            stem = word[:-1]
+            if stem in CANONICAL_SYNONYMS:
+                word = CANONICAL_SYNONYMS[stem]
+            elif len(word) > 5:
+                word = word[:-1]
+        elif len(word) > 4 and word.endswith("s") and not word.endswith(("ss", "us", "is")):
             word = word[:-1]
         if word in CANONICAL_SYNONYMS:
             word = CANONICAL_SYNONYMS[word]
@@ -925,13 +1039,39 @@ def _semantic_match(
     title_shared = len(left_title & right_title)
     if title_shared >= MIN_SHARED_TOKENS and _cosine_sim(left_title, right_title) >= COSINE_THRESHOLD:
         return True
+
+    # Asymmetric title containment: when a concise headline is a subset of a detailed headline
+    min_title_len = min(len(left_title), len(right_title))
+    if min_title_len >= 3 and title_shared >= 3 and (title_shared / min_title_len) >= 0.65:
+        return True
+
+    # Title-to-story containment: when a short RSS headline without scraped body matches a full article body
+    if len(left_title) >= 4 and title_shared >= 2 and (len(left_title & right_story) / len(left_title)) >= 0.75:
+        return True
+    if len(right_title) >= 4 and title_shared >= 2 and (len(right_title & left_story) / len(right_title)) >= 0.75:
+        return True
+
     story_shared = len(left_story & right_story)
-    if title_shared >= 2 and story_shared >= 5 and _cosine_sim(left_story, right_story) >= 0.40:
+    if title_shared >= 2 and story_shared >= 5 and _cosine_sim(left_story, right_story) >= 0.38:
         return True
     return (
         (title_shared >= 1 and story_shared >= 7 and _cosine_sim(left_story, right_story) >= 0.30)
         or (story_shared >= 9 and _cosine_sim(left_story, right_story) >= 0.50)
     )
+
+
+def _record_tokens(record: dict) -> tuple[set[str], set[str]]:
+    """Extract and re-tokenize stored record headlines/summaries so cached entries use latest rules."""
+    right_title = set(record.get("tt", "").split(",")) - {""}
+    for field in ("original_headline", "canonical_headline"):
+        if record.get(field):
+            right_title |= set(_tokenize(_sim_text({"title": record[field]})))
+
+    right_story = set(record.get("st", "").split(",")) - {""}
+    right_story |= right_title
+    if record.get("canonical_summary"):
+        right_story |= set(_tokenize(record["canonical_summary"]))
+    return right_title, right_story
 
 
 def compute_story_similarity(left_entry: dict, right_entry_or_record: dict) -> float:
@@ -942,15 +1082,12 @@ def compute_story_similarity(left_entry: dict, right_entry_or_record: dict) -> f
     left_title = set(_tokenize(_sim_text(left_entry)))
     left_story = _story_tokens(left_entry)
 
-    if "tt" in right_entry_or_record or "canonical_summary" in right_entry_or_record:
-        right_title = set(right_entry_or_record.get("tt", "").split(",")) - {""}
-        if not right_title and right_entry_or_record.get("original_headline"):
-            right_title = set(_tokenize(right_entry_or_record["original_headline"]))
-        right_story = set(right_entry_or_record.get("st", "").split(",")) - {""}
-        if not right_story:
-            right_story = right_title | set(
-                _tokenize(right_entry_or_record.get("canonical_summary", ""))
-            )
+    if (
+        "tt" in right_entry_or_record
+        or "canonical_summary" in right_entry_or_record
+        or "original_headline" in right_entry_or_record
+    ):
+        right_title, right_story = _record_tokens(right_entry_or_record)
     else:
         right_title = set(_tokenize(_sim_text(right_entry_or_record)))
         right_story = _story_tokens(right_entry_or_record)
@@ -1033,13 +1170,77 @@ def _fetch_feed(url: str):
     return feedparser.parse(out)
 
 
+def _sync_seen_from_ntfy(seen: dict) -> dict:
+    """Backfill 72-hour rolling memory from recent ntfy topic history so no already-sent
+    story can ever be resent even if the GitHub Actions cache misses."""
+    if not NTFY_TOPIC or NTFY_TOPIC == "dedup-test-topic":
+        return seen
+    poll_url = f"{NTFY_SERVER.rstrip('/')}/{NTFY_TOPIC}/json?poll=1&since={SEEN_SCAN_HOURS}h"
+    try:
+        resp = requests.get(poll_url, timeout=(3, 6))
+        if resp.status_code != 200:
+            return seen
+        for line in resp.text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except Exception:
+                continue
+            if item.get("event") != "message":
+                continue
+            msg = item.get("message") or ""
+            msg_lines = [ln.strip() for ln in msg.splitlines() if ln.strip()]
+            headline = (item.get("title") or "").strip()
+            if not headline or headline == "Pakistan & World News":
+                headline = msg_lines[0] if msg_lines else ""
+            if not headline:
+                continue
+
+            summary_val = ""
+            link_val = (item.get("click") or "").strip()
+            for ln in msg_lines:
+                if ln.startswith("Summary:"):
+                    summary_val = ln[len("Summary:"):].strip()
+                elif ln.startswith("Link:") and not link_val:
+                    link_val = ln[len("Link:"):].strip()
+
+            tk = title_key(headline)
+            msg_ts = int(item.get("time") or time.time())
+            synthetic = {"title": headline, "summary": summary_val, "link": link_val}
+            if tk not in seen:
+                rec = build_memory_record(synthetic, "ntfy-history", tk)
+                rec["ts"] = msg_ts
+                seen[tk] = rec
+            else:
+                existing = seen[tk]
+                if isinstance(existing, dict):
+                    rt, rs = _record_tokens(existing)
+                    rt |= set(_tokenize(_sim_text(synthetic)))
+                    rs |= _story_tokens(synthetic)
+                    existing["tt"] = ",".join(sorted(rt))
+                    existing["st"] = ",".join(sorted(rs)[:140])
+                    if link_val:
+                        canon_u = _canonical_url(link_val)
+                        if canon_u:
+                            urls = set(existing.get("urls", []))
+                            urls.add(canon_u)
+                            existing["urls"] = sorted(urls)
+    except Exception as exc:
+        print(f"  ⚠  ntfy history sync skipped: {exc}", file=sys.stderr)
+    return seen
+
+
 def load_seen() -> dict:
+    seen = {}
     if STATE_FILE.exists():
         try:
-            return _prune_seen(json.loads(STATE_FILE.read_text()))
+            seen = _prune_seen(json.loads(STATE_FILE.read_text()))
         except Exception:
-            return {}
-    return {}
+            seen = {}
+    seen = _sync_seen_from_ntfy(seen)
+    return _prune_seen(seen)
 
 
 def save_seen(seen: dict) -> None:
@@ -1085,10 +1286,9 @@ def seen_semantic_match(
     for val in seen.values():
         if not isinstance(val, dict):
             continue
-        tt = val.get("tt")
-        if not tt:
+        seen_tokens, _ = _record_tokens(val)
+        if not seen_tokens:
             continue
-        seen_tokens = set(tt.split(","))
         if len(tokens & seen_tokens) < min_shared:
             continue
         if _cosine_sim(tokens, seen_tokens) >= cos_threshold:
@@ -1121,8 +1321,7 @@ def seen_story_match(entry: dict, seen: dict) -> bool:
     for val in seen.values():
         if not isinstance(val, dict):
             continue
-        seen_title = set(val.get("tt", "").split(",")) - {""}
-        seen_story = set(val.get("st", "").split(",")) - {""}
+        seen_title, seen_story = _record_tokens(val)
         if not seen_story:
             seen_story = seen_title
         if _semantic_match(title_tokens, story_tokens, seen_title, seen_story):
@@ -1261,15 +1460,13 @@ def format_message(
     canonical: dict | None = None,
 ) -> str:
     """Step 7: Format notification strictly as NEW STORY or SIGNIFICANT UPDATE with
-    Headline, 100-150w Summary, Key Facts bullets, Source, Published timestamp,
-    Story Type, and direct clickable Link."""
+    Headline, 100-150w Summary, Source, Published timestamp, Story Type, and direct
+    clickable Link (without Key Facts)."""
     if canonical is None:
         canonical = build_canonical_story(entry, source)
 
     headline = canonical.get("headline") or (entry.get("title") or "No title").strip()
     summary = entry.get("article_summary") or canonical.get("canonical_summary") or headline
-    bullets = (canonical.get("key_facts") or {}).get("bullets") or [headline]
-    facts_line = " ".join(f"• {b}" for b in bullets[:3])
     link = (entry.get("link") or "").strip()
 
     ts = datetime.now(PKT).strftime("%b %d, %Y %I:%M %p PKT")
@@ -1287,8 +1484,6 @@ def format_message(
         headline,
         "",
         f"Summary: {summary}",
-        "",
-        f"Key Facts: {facts_line}",
         "",
         f"Source: {source}",
         "",

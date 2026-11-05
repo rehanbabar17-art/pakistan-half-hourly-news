@@ -223,12 +223,72 @@ class DuplicateDetectionTests(unittest.TestCase):
         }
         msg = news.format_message(entry, "Dawn", "national", story_type="NEW STORY")
         self.assertIn("Summary:", msg)
-        self.assertIn("Key Facts: •", msg)
+        self.assertNotIn("Key Facts:", msg)
         self.assertIn("Source: Dawn", msg)
         self.assertIn("Published:", msg)
         self.assertIn("Story Type: NEW STORY", msg)
         self.assertIn("Link: https://www.dawn.com/news/123456", msg)
         self.assertFalse(news.send_to_ntfy(msg, title="Test", link=""))
+
+    def test_fcc_phc_3mpo_cross_source_duplicate_is_suppressed(self):
+        dawn_entry = {
+            "title": "FCC bars PHC from hearing cases related to PTI workers' detention under MPO",
+            "summary": (
+                "ISLAMABAD: The Federal Constitutional Court (FCC) on Thursday restrained "
+                "the Peshawar High Court (PHC) from hearing cases related to the detention "
+                "of PTI workers and activists under the Maintenance of Public Order Ordinance (MPO)."
+            ),
+            "link": "https://www.dawn.com/news/2042319/fcc-bars-phc-from-hearing-cases-related-to-pti-workers-detention-under-mpo",
+        }
+        brecorder_entry = {
+            "title": "PHC barred from hearing petitions against 3-MPO arrests - Business Recorder",
+            "summary": (
+                '<a href="https://news.google.com/rss/articles/CBMi..." target="_blank">'
+                "PHC barred from hearing petitions against 3-MPO arrests</a>"
+                '&nbsp;&nbsp;<font color="#6f6f6f">Business Recorder</font>'
+            ),
+            "link": "https://news.google.com/rss/articles/CBMimwFBVV95cUxOX00?oc=5",
+        }
+        self.assertTrue(news._same_article_entries(dawn_entry, brecorder_entry))
+
+        seen = {
+            "dawn-phc": news.build_memory_record(
+                dawn_entry, "Dawn", "dawn-phc", "NEW STORY"
+            )
+        }
+        classification, _, _ = news.evaluate_entry_against_memory(
+            brecorder_entry, seen, "Business Recorder"
+        )
+        self.assertEqual(classification, "DUPLICATE")
+
+        # Also verify Google News <font> publisher suffix is stripped from summary
+        msg = news.format_message(brecorder_entry, "Business Recorder", "national")
+        self.assertNotIn("arrests Business Recorder", msg)
+
+    def test_ecp_punjab_and_kp_local_election_duplicates_are_suppressed(self):
+        ecp_punjab_dawn = {
+            "title": "ECP fixes Feb 7 as polling date for first phase of Punjab local govt elections",
+            "summary": "The Election Commission of Pakistan fixed February 7 for Punjab local government polls.",
+            "link": "https://www.dawn.com/news/2042304",
+        }
+        ecp_punjab_gnews = {
+            "title": "Pakistan sets Punjab local elections for February 7, 2027 - Dawn",
+            "summary": "Pakistan sets Punjab local elections for February 7, 2027",
+            "link": "https://news.google.com/rss/articles/CBMi123",
+        }
+        self.assertTrue(news._same_article_entries(ecp_punjab_dawn, ecp_punjab_gnews))
+
+        ecp_kp_brecorder = {
+            "title": "ECP halts local government election preparations in KP following governors order",
+            "summary": "ECP halts local government election preparations in KP following governors order",
+            "link": "https://news.google.com/rss/articles/CBMi456",
+        }
+        ecp_kp_dawn = {
+            "title": "Why did the ECP postpone local govt polls in Khyber Pakhtunkhwa?",
+            "summary": "The Election Commission of Pakistan postponed local government polls in Khyber Pakhtunkhwa.",
+            "link": "https://www.dawn.com/news/2042303",
+        }
+        self.assertTrue(news._same_article_entries(ecp_kp_brecorder, ecp_kp_dawn))
 
 
 if __name__ == "__main__":

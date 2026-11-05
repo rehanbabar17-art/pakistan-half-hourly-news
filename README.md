@@ -64,8 +64,6 @@ Headline
 
 Summary: [100-150 word summary]
 
-Key Facts: • Fact 1 • Fact 2 • Fact 3
-
 Source: [source name]
 
 Published: [timestamp]
